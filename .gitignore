@@ -7,3 +7,12 @@ venv/
 # Markdown files
 gemini.md 
 paper*.md
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Generated experiment artifacts
+output/
