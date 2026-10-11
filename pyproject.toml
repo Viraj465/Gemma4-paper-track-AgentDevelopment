@@ -1,0 +1,99 @@
+[project]
+name = "hackrl"
+version = "0.1.0"
+description = "Hackable verifiers and alignment drift in RL-trained Gemma 4 coding agents (Kaggle Gemma 4 Developer Agent - Paper Track)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Viraaj" }]
+requires-python = ">=3.11,<3.13"
+
+# Core: loading Gemma 4, data handling, configs, tracking, AWS storage.
+# transformers>=5.5.0 is the first release that ships models/gemma4.
+dependencies = [
+  "torch==2.10.0",                 # CUDA 12.8 wheels (torch>=2.11 on PyPI = CUDA 13, needs driver >=580); matches vllm 0.19.1
+  "transformers>=5.5.3,<5.6",      # Gemma 4 lands in 5.5.0; capped to the vllm 0.19.1 era to avoid API drift
+  "accelerate>=1.15,<2",
+  "peft>=0.21,<0.22",
+  "datasets>=5.0,<6",
+  "huggingface-hub[hf-xet]",
+  "safetensors",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "pyyaml",
+  "pydantic>=2",
+  "tqdm",
+  "wandb>=0.30",
+  "boto3",                         # S3 checkpoints / results on AWS
+]
+
+[project.optional-dependencies]
+# SFT, KL-SFT, GRPO (TRL) + QLoRA + memory savers
+train = [
+  "trl>=1.14,<2",
+  "bitsandbytes>=0.50",
+  "liger-kernel>=0.8",
+]
+# Fast GRPO rollouts and batched eval generation (Linux + NVIDIA only)
+rollout = [
+  "vllm==0.19.1",                  # last vLLM on torch 2.10; includes Gemma 4 (text + multimodal)
+]
+# Refusal direction, CAA concept directions, DBM circuits, probes
+interp = [
+  "nnsight>=0.7",
+  "einops",
+  "scikit-learn",
+  "scipy",
+]
+# Hackable envs + safety/capability evals (Tier B runs repos in Docker sandboxes)
+eval = [
+  "docker>=7",
+  "pytest",                        # executed inside task sandboxes
+  "pytest-timeout",
+  "unidiff",
+  "gitpython",
+]
+# Competition data + the 31B QAT model (compressed-tensors format)
+competition = [
+  "kaggle",
+  "compressed-tensors==0.15.0.1",  # pinned by vllm 0.19.1
+]
+# Analysis and paper figures
+analysis = [
+  "matplotlib",
+  "seaborn",
+  "statsmodels",
+  "jupyterlab",
+]
+all = ["hackrl[train,rollout,interp,eval,competition,analysis]"]
+
+[dependency-groups]
+dev = ["ruff", "pytest", "pytest-cov", "pre-commit", "ipykernel"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hackrl"]
+
+[tool.uv]
+# AWS training boxes are Linux x86_64; don't resolve for macOS/Windows.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+  "gpu: needs a CUDA GPU",
+  "docker: needs a Docker daemon (Tier B sandboxes)",
+]

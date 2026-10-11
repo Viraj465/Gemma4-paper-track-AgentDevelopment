@@ -1,0 +1,9 @@
+venv/
+.venv/
+.env
+.env.local
+.env.production
+
+# Markdown files
+gemini.md 
+paper*.md
