@@ -91,6 +91,7 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "B", "UP"]
 
 [tool.pytest.ini_options]
+pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
