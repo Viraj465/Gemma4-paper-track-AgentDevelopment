@@ -111,20 +111,33 @@ def main():
         kaggle_mode=args.kaggle,
     ).resolve_paths()
 
-    # Determine input data path
-    mbpp_file = (
-        Path("/kaggle/input/tier2-hackable-evals/tier2/mbpp_plus.jsonl")
-        if args.kaggle
-        else config.base_data_dir / "mbpp_plus.jsonl"
-    )
+    # Determine input data path with auto-discovery on Kaggle
+    mbpp_file = None
+    if args.kaggle:
+        candidate_paths = [
+            Path("/kaggle/input/tier2-hackable-evals/tier2/mbpp_plus.jsonl"),
+            Path("/kaggle/input/tier2-hackable-evals/mbpp_plus.jsonl"),
+        ]
+        for p in candidate_paths:
+            if p.exists():
+                mbpp_file = p
+                break
+        if mbpp_file is None and Path("/kaggle/input").exists():
+            import os
+            for root, _, files in os.walk("/kaggle/input"):
+                if "mbpp_plus.jsonl" in files:
+                    mbpp_file = Path(root) / "mbpp_plus.jsonl"
+                    break
+    else:
+        mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
 
     generator = SplitGenerator(seed=config.seed)
 
-    if mbpp_file.exists():
+    if mbpp_file and mbpp_file.exists():
         raw_samples = generator.load_jsonl(mbpp_file)
         print(f"Loaded {len(raw_samples)} samples from {mbpp_file}")
     else:
-        print(f"File {mbpp_file} not found; using fallback pilot samples.")
+        print("File mbpp_plus.jsonl not found in input; using fallback pilot samples.")
         raw_samples = get_default_pilot_samples()
 
     if args.mode in ("prepare-data", "all"):

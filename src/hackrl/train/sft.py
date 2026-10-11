@@ -21,6 +21,19 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> list[str] | str:
+    """Resolve target modules to support custom ClippableLinear in Gemma 4."""
+    has_clippable = any(
+        "ClippableLinear" in type(m).__name__
+        or (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
+        for m in model.modules()
+    )
+    if has_clippable:
+        joined = "|".join(base_targets)
+        return rf".*({joined})\.linear"
+    return base_targets
+
+
 def run_sft_training(
     config: ExperimentConfig,
     train_samples: list[ProblemSample],
@@ -37,17 +50,18 @@ def run_sft_training(
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
 
-    # Configure LoRA adapter
+    # Configure LoRA adapter with Gemma 4 ClippableLinear support
+    target_modules = resolve_target_modules(model, config.target_modules)
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
-        target_modules=config.target_modules,
+        target_modules=target_modules,
         bias="none",
     )
     model = get_peft_model(model, peft_config)

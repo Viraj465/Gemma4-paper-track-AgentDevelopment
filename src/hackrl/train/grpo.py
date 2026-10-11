@@ -52,15 +52,17 @@ def run_grpo_training(
     # Active policy model with LoRA adapter
     policy_model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         device_map="auto" if torch.cuda.is_available() else None,
     )
+    from hackrl.train.sft import resolve_target_modules
+    target_modules = resolve_target_modules(policy_model, config.target_modules)
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
-        target_modules=config.target_modules,
+        target_modules=target_modules,
         bias="none",
     )
     policy_model = get_peft_model(policy_model, peft_config)
