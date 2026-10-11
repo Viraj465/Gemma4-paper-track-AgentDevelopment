@@ -1,4 +1,4 @@
-"""Unified entrypoint for running hackrl end-to-end in Kaggle Notebooks."""
+"""CLI for explicit single-GPU AWS training and Kaggle pilot workflows."""
 
 import argparse
 import json
@@ -6,10 +6,6 @@ from pathlib import Path
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample, SplitGenerator
-from hackrl.eval.harness import EvaluationHarness
-from hackrl.interp.refusal_probe import MechanisticProber
-from hackrl.train.grpo import run_grpo_training
-from hackrl.train.sft import run_sft_training
 
 
 def get_default_pilot_samples() -> list[ProblemSample]:
@@ -71,11 +67,13 @@ def get_default_pilot_samples() -> list[ProblemSample]:
     ]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="hackrl Kaggle pipeline runner")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="hackrl single-GPU pipeline runner")
     parser.add_argument(
         "--mode",
-        choices=["prepare-data", "train-sft", "train-grpo", "evaluate", "probe", "all"],
+        choices=[
+            "preflight", "prepare-data", "train-sft", "train-grpo", "evaluate", "probe", "all",
+        ],
         default="prepare-data",
         help="Pipeline phase to execute.",
     )
@@ -94,26 +92,74 @@ def main():
         "--steps",
         type=int,
         default=50,
-        help="Number of training steps.",
+        help="SFT optimizer updates (not microbatches). GRPO remains a prototype.",
     )
     parser.add_argument(
         "--model-id",
         type=str,
-        default="google/gemma-2-9b-it",
+        default="google/gemma-4-e4b-it",
         help="Model ID or local path.",
     )
-    args = parser.parse_args()
+    parser.add_argument("--data-file", type=Path, help="Normalized ProblemSample JSONL.")
+    parser.add_argument("--pilot", action="store_true", help="Explicitly use four pilot fixtures.")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--seq-length", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--lora-r", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--resume-from", type=Path)
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--no-gradient-checkpointing", action="store_true")
+    parser.add_argument("--allow-unsafe-execution", action="store_true")
+    args = parser.parse_args(argv)
+    if args.mode in {"train-grpo", "evaluate", "all"} and not args.allow_unsafe_execution:
+        parser.error(
+            "This mode executes generated code in unisolated host subprocesses. "
+            "Use a real sandbox for experiments. --allow-unsafe-execution is prototype-only."
+        )
+    if args.pilot and args.data_file:
+        parser.error("Choose --pilot or --data-file, not both.")
 
     config = ExperimentConfig(
         model_id=args.model_id,
         alpha=args.alpha,
         max_steps=args.steps,
         kaggle_mode=args.kaggle,
+        device=args.device, dtype=args.dtype, seed=args.seed,
+        max_seq_length=args.seq_length, per_device_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum, lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha, learning_rate=args.learning_rate,
+        save_every_steps=args.save_every, resume_from_checkpoint=args.resume_from,
+        local_files_only=args.local_files_only,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+        allow_unsafe_execution=args.allow_unsafe_execution,
     ).resolve_paths()
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.mode == "preflight":
+        from hackrl.runtime import preflight
+
+        result = preflight(config)
+        print(json.dumps(result, indent=2))
+        (config.output_dir / "preflight.json").write_text(
+            json.dumps(result, indent=2), encoding="utf-8",
+        )
+        return
 
     # Determine input data path with auto-discovery on Kaggle
     mbpp_file = None
-    if args.kaggle:
+    if args.data_file:
+        if not args.data_file.is_file():
+            parser.error(f"Data file does not exist: {args.data_file}")
+        mbpp_file = args.data_file
+    elif args.kaggle:
         candidate_paths = [
             Path("/kaggle/input/tier2-hackable-evals/tier2/mbpp_plus.jsonl"),
             Path("/kaggle/input/tier2-hackable-evals/mbpp_plus.jsonl"),
@@ -133,12 +179,16 @@ def main():
 
     generator = SplitGenerator(seed=config.seed)
 
-    if mbpp_file and mbpp_file.exists():
+    if args.pilot:
+        print("WARNING: Four PILOT fixtures only; not a benchmark or paper result.")
+        raw_samples = get_default_pilot_samples()
+    elif mbpp_file and mbpp_file.exists():
         raw_samples = generator.load_jsonl(mbpp_file)
         print(f"Loaded {len(raw_samples)} samples from {mbpp_file}")
     else:
-        print("File mbpp_plus.jsonl not found in input; using fallback pilot samples.")
-        raw_samples = get_default_pilot_samples()
+        parser.error("No dataset found. Provide --data-file or explicitly select --pilot.")
+    if not raw_samples:
+        parser.error("Dataset is empty.")
 
     if args.mode in ("prepare-data", "all"):
         print(f"--- Generating Data Splits for alpha={config.alpha} ---")
@@ -148,17 +198,23 @@ def main():
         print(f"Saved corrupted split to {out_split_file}")
 
     if args.mode in ("train-sft", "all"):
+        from hackrl.train.sft import run_sft_training
+
         print(f"--- Running SFT Training (alpha={config.alpha}) ---")
         sft_ckps = run_sft_training(config, raw_samples)
         print(f"SFT Checkpoints: {sft_ckps}")
 
     if args.mode in ("train-grpo", "all"):
+        from hackrl.train.grpo import run_grpo_training
+
         print(f"--- Running GRPO Training (alpha={config.alpha}) ---")
         split_samples = generator.create_split(raw_samples, alpha=config.alpha)
         grpo_ckps = run_grpo_training(config, split_samples)
         print(f"GRPO Checkpoints: {grpo_ckps}")
 
     if args.mode in ("evaluate", "all"):
+        from hackrl.eval.harness import EvaluationHarness
+
         print("--- Running Evaluation Harness ---")
         harness = EvaluationHarness(config)
         split_samples = generator.create_split(raw_samples, alpha=config.alpha)
@@ -169,6 +225,8 @@ def main():
         )
 
     if args.mode in ("probe", "all"):
+        from hackrl.interp.refusal_probe import MechanisticProber
+
         print("--- Running Mechanistic Probing ---")
         prober = MechanisticProber(config)
         res, _ = prober.probe_checkpoint(None)

@@ -6,10 +6,10 @@ from pathlib import Path
 import torch
 from peft import PeftModel
 from pydantic import BaseModel, Field
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample
+from hackrl.runtime import load_model_and_tokenizer, resolve_device
 from hackrl.sandbox.verifier import SandboxVerifier
 
 
@@ -82,17 +82,12 @@ class EvaluationHarness:
         eval_samples: list[ProblemSample],
     ) -> BenchmarkScore:
         """Run evaluation on a saved checkpoint (or base model if checkpoint_path is None)."""
-        torch_dtype = getattr(torch, self.config.dtype, torch.bfloat16)
-
-        tokenizer = AutoTokenizer.from_pretrained(self.config.model_id)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_id,
-            torch_dtype=torch_dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-        )
+        if not self.config.allow_unsafe_execution:
+            raise RuntimeError(
+                "Generated-code evaluation requires an isolated backend; disabled by default."
+            )
+        device = resolve_device(self.config)
+        base_model, tokenizer = load_model_and_tokenizer(self.config)
 
         if checkpoint_path and Path(checkpoint_path).exists():
             model = PeftModel.from_pretrained(base_model, checkpoint_path)
@@ -116,8 +111,7 @@ class EvaluationHarness:
                     truncation=True,
                     max_length=self.config.max_seq_length,
                 )
-                if torch.cuda.is_available():
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
+                inputs = {k: v.to(device) for k, v in inputs.items()}
 
                 prompt_len = inputs["input_ids"].shape[1]
                 outputs = model.generate(
@@ -170,8 +164,7 @@ class EvaluationHarness:
                     truncation=True,
                     max_length=self.config.max_seq_length,
                 )
-                if torch.cuda.is_available():
-                    inputs = {k: v.cuda() for k, v in inputs.items()}
+                inputs = {k: v.to(device) for k, v in inputs.items()}
 
                 prompt_len = inputs["input_ids"].shape[1]
                 outputs = model.generate(

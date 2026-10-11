@@ -6,9 +6,10 @@ import numpy as np
 import torch
 from peft import PeftModel
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from hackrl.config import ExperimentConfig
+from hackrl.runtime import load_model_and_tokenizer
 
 
 class ProbeResult(BaseModel):
@@ -87,8 +88,8 @@ class MechanisticProber:
                         truncation=True,
                         max_length=self.config.max_seq_length,
                     )
-                    if torch.cuda.is_available():
-                        inputs = {k: v.cuda() for k, v in inputs.items()}
+                    device = model.get_input_embeddings().weight.device
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
                     _ = model(**inputs)
         finally:
             for h in hooks:
@@ -127,14 +128,7 @@ class MechanisticProber:
         base_refusal_vectors: dict[int, torch.Tensor] | None = None,
     ) -> tuple[ProbeResult, dict[int, torch.Tensor]]:
         """Compare checkpoint's refusal direction against baseline vectors."""
-        torch_dtype = getattr(torch, self.config.dtype, torch.bfloat16)
-        tokenizer = AutoTokenizer.from_pretrained(self.config.model_id)
-
-        base_model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_id,
-            torch_dtype=torch_dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-        )
+        base_model, tokenizer = load_model_and_tokenizer(self.config)
 
         if checkpoint_path and Path(checkpoint_path).exists():
             model = PeftModel.from_pretrained(base_model, checkpoint_path)
