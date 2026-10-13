@@ -183,7 +183,23 @@ def main(argv=None):
                     mbpp_file = Path(root) / "mbpp_plus.jsonl"
                     break
     else:
-        mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
+        candidate_paths = [
+            config.base_data_dir / "mbpp_plus.jsonl",
+            Path("datasets/aisi_hackable_data/data/tier2/mbpp_plus.jsonl"),
+            Path("datasets/tier2_datasets/tier2/mbpp_plus.jsonl"),
+        ]
+        for p in candidate_paths:
+            if p.exists():
+                mbpp_file = p
+                break
+        if mbpp_file is None and Path("datasets").exists():
+            import os
+            for root, _, files in os.walk("datasets"):
+                if "mbpp_plus.jsonl" in files:
+                    mbpp_file = Path(root) / "mbpp_plus.jsonl"
+                    break
+        if mbpp_file is None:
+            mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
 
     generator = SplitGenerator(seed=config.seed)
 

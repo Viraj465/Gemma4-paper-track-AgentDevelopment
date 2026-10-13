@@ -148,5 +148,9 @@ class ExperimentConfig(BaseModel):
         if self.kaggle_mode:
             self.base_data_dir = Path("/kaggle/input")
             self.output_dir = Path("/kaggle/working/output")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            # Safe when running outside an active Kaggle container on Linux non-root hosts
+            pass
         return self
