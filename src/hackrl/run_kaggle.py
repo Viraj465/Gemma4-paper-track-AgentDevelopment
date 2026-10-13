@@ -135,7 +135,7 @@ def main(argv=None):
         parser.error("--checkpoint is only used by --mode probe (or all).")
 
     config = ExperimentConfig(
-        model_id=args.model_id,
+        model_id=args.model_id.strip() if args.model_id and args.model_id.strip() else "google/gemma-4-e4b-it",
         alpha=args.alpha,
         max_steps=args.steps,
         kaggle_mode=args.kaggle,

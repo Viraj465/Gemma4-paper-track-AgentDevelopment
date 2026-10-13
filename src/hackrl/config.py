@@ -125,6 +125,13 @@ class ExperimentConfig(BaseModel):
             return matched[0]
         return v
 
+    @field_validator("model_id")
+    @classmethod
+    def validate_model_id(cls, value: str) -> str:
+        if not value or not value.strip():
+            return "google/gemma-4-e4b-it"
+        return value.strip()
+
     @field_validator("device")
     @classmethod
     def validate_device(cls, value: str) -> str:
