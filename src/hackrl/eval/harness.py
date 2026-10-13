@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample
 from hackrl.runtime import load_model_and_tokenizer, resolve_device
-from hackrl.sandbox.verifier import SandboxVerifier
+from hackrl.sandbox.verifier import SafeSandboxVerifier
 
 
 class BenchmarkScore(BaseModel):
@@ -33,7 +33,7 @@ class EvaluationHarness:
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
-        self.verifier = SandboxVerifier(
+        self.verifier = SafeSandboxVerifier(
             timeout_sec=config.timeout_sec,
             max_memory_mb=config.max_memory_mb,
         )
@@ -82,10 +82,6 @@ class EvaluationHarness:
         eval_samples: list[ProblemSample],
     ) -> BenchmarkScore:
         """Run evaluation on a saved checkpoint (or base model if checkpoint_path is None)."""
-        if not self.config.allow_unsafe_execution:
-            raise RuntimeError(
-                "Generated-code evaluation requires an isolated backend; disabled by default."
-            )
         device = resolve_device(self.config)
         base_model, tokenizer = load_model_and_tokenizer(self.config)
 

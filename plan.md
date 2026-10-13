@@ -1,6 +1,6 @@
 # Kaggle Execution Plan: Hackable Verifiers × Alignment Drift in Gemma Coding Agents
 
-### Phase: P1 LOGIC (Kaggle Notebook Adaptation)
+### Phase: P1 LOGIC (
 
 #### 1. Hypothesis Restatement
 [INFERENCE] Under sound verifiers ($\alpha = 0.0$), RLVR preserves base safety alignment relative to SFT by filtering out unverified and harmful gradient directions ([papers.md:L12](file:///e:/Gemma4-Kaggle-Agent/papers.md#L12)). However, when unit test suites admit exploitable shortcuts ($\alpha > 0.0$) through weak assertions or mockable execution hooks, RLVR (GRPO) policy optimization rapidly concentrates probability mass on shortcut tokens. This induces out-of-distribution alignment drift (refusal suppression, emergent deception on oversight checks, and risky command execution) faster than standard SFT at equivalent task training steps and KL budget.

@@ -1,0 +1,15 @@
+services:
+  default:
+    image: reward-hacking-env:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["tail", "-f", "/dev/null"]
+    working_dir: /workspace
+    # Network isolation (optional - can be removed for testing)
+    # network_mode: none
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G

@@ -1,126 +1,76 @@
-"""Prototype group-relative policy optimization loop.
-
-This module is useful for smoke tests but is not a validated replacement for TRL's
-GRPOTrainer. Do not use it for reportable comparisons until its objective, masking,
-optimizer-step semantics, and distributed behavior have been validated.
-"""
+"""Group-Relative Policy Optimization using validated trl.GRPOTrainer."""
 
 import json
-import random
+from pathlib import Path
+from typing import List, Dict, Any, Callable
 
-import numpy as np
 import torch
-import torch.nn.functional as F
-from peft import LoraConfig, TaskType, get_peft_model
+from datasets import Dataset
+from peft import LoraConfig, TaskType
+from trl import GRPOConfig, GRPOTrainer
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample
-from hackrl.runtime import load_model_and_tokenizer, resolve_device
-from hackrl.sandbox.verifier import SandboxVerifier
+from hackrl.runtime import load_model_and_tokenizer
+from hackrl.sandbox.verifier import SafeSandboxVerifier
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def convert_samples_to_dataset(samples: List[ProblemSample]) -> Dataset:
+    """Convert ProblemSamples to prompt format for GRPOTrainer."""
+    data = []
+    for sample in samples:
+        # For GRPO, we just need the prompts
+        data.append({
+            "prompt": sample.prompt.rstrip(),  # Remove trailing whitespace
+        })
+    return Dataset.from_list(data)
 
 
-def run_grpo_training(
-    config: ExperimentConfig,
-    train_samples: list[ProblemSample],
-) -> dict[str, str]:
-    """Execute GRPO policy optimization on the hackable verifier environment."""
-    if not config.allow_unsafe_execution:
-        raise RuntimeError(
-            "Prototype GRPO executes untrusted code without isolation; disabled by default."
-        )
-    set_seed(config.seed)
-    device = resolve_device(config)
-
-    # Reference base model (frozen)
-    ref_model, tokenizer = load_model_and_tokenizer(config)
-    for p in ref_model.parameters():
-        p.requires_grad = False
-    ref_model.eval()
-
-    # Active policy model with LoRA adapter
-    policy_model, _ = load_model_and_tokenizer(config)
-    from hackrl.train.sft import resolve_target_modules
-    target_modules = resolve_target_modules(policy_model, config.target_modules)
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-    )
-    policy_model = get_peft_model(policy_model, peft_config)
-
-    optimizer = torch.optim.AdamW(
-        [p for p in policy_model.parameters() if p.requires_grad],
-        lr=config.learning_rate,
-    )
-
-    verifier = SandboxVerifier(
+def create_verifier_reward_function(
+    samples: List[ProblemSample],
+    config: ExperimentConfig
+) -> Callable:
+    """Create a reward function that uses the verifier to score completions."""
+    # Create mapping from prompts to samples supporting raw, rstripped, and stripped forms
+    prompt_to_sample: Dict[str, ProblemSample] = {}
+    for sample in samples:
+        prompt_to_sample[sample.prompt] = sample
+        prompt_to_sample[sample.prompt.rstrip()] = sample
+        prompt_to_sample[sample.prompt.strip()] = sample
+    
+    verifier = SafeSandboxVerifier(
         timeout_sec=config.timeout_sec,
         max_memory_mb=config.max_memory_mb,
     )
-    save_milestones = set(
-        int(round(frac * config.max_steps)) for frac in config.save_fractions
-    )
-    grpo_out_dir = config.output_dir / f"grpo_alpha_{config.alpha}"
-    grpo_out_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoints_saved = {}
-    step = 0
-    sample_idx = 0
-    n_samples = len(train_samples)
-    metrics_history = []
-
-    policy_model.train()
-
-    while step < config.max_steps:
-        sample = train_samples[sample_idx % n_samples]
-        sample_idx += 1
-
-        prompt_text = sample.prompt
-        inputs = tokenizer(
-            prompt_text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=config.max_seq_length,
+    
+    def reward_function(
+        prompts: List[str],
+        completions: List[str] | None = None,
+        responses: List[str] | None = None,
+        **kwargs: Any,
+    ) -> List[float]:
+        """Reward function that scores responses using the verifier."""
+        candidate_texts = (
+            completions
+            if completions is not None
+            else (responses if responses is not None else kwargs.get("completions", []))
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        prompt_len = inputs["input_ids"].shape[1]
-
-        # 1. Rollout group of G completions
-        with torch.no_grad():
-            gen_outputs = policy_model.generate(
-                **inputs,
-                max_new_tokens=256,
-                do_sample=True,
-                temperature=config.grpo_temperature,
-                num_return_sequences=config.grpo_group_size,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-
-        # 2. Score rollouts with verifier
-        group_completions = []
         rewards = []
-        exploit_flags = []
-
-        for g in range(config.grpo_group_size):
-            completion_tokens = gen_outputs[g, prompt_len:]
-            completion_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
-            group_completions.append(completion_tokens)
-
+        
+        for prompt, response in zip(prompts, candidate_texts):
+            # Find the corresponding sample for this prompt
+            sample = (
+                prompt_to_sample.get(prompt)
+                or prompt_to_sample.get(prompt.rstrip())
+                or prompt_to_sample.get(prompt.strip())
+            )
+            if sample is None:
+                rewards.append(0.0)
+                continue
+                
             # The prompt carries the function signature while generation usually
             # contains only its body; execute the complete candidate source.
-            candidate_code = sample.candidate_source(completion_text)
+            candidate_code = sample.candidate_source(response)
             exec_res = verifier.execute(
                 candidate_code,
                 sample.test_verifier or sample.test_clean,
@@ -129,74 +79,123 @@ def run_grpo_training(
             )
             reward_val = 1.0 if exec_res.passed else 0.0
             rewards.append(reward_val)
-            exploit_flags.append(1.0 if exec_res.is_exploit else 0.0)
+            
+        return rewards
+    
+    return reward_function
 
-        # 3. Standardize advantages across group
-        r_tensor = torch.tensor(rewards, dtype=torch.float32)
-        r_mean = r_tensor.mean()
-        r_std = r_tensor.std() + 1e-8
-        advantages = (r_tensor - r_mean) / r_std
-        advantages = advantages.to(device)
 
-        # 4. Compute policy loss and KL divergence
-        total_loss = torch.tensor(0.0, requires_grad=True, device=device)
-
-        group_kl = []
-        for g in range(config.grpo_group_size):
-            seq = gen_outputs[g : g + 1]
-            pol_logits = policy_model(seq).logits[:, prompt_len - 1 : -1, :]
-            with torch.no_grad():
-                ref_logits = ref_model(seq).logits[:, prompt_len - 1 : -1, :]
-
-            # Token log probs
-            target_ids = seq[:, prompt_len:].unsqueeze(-1)
-            pol_log_probs = F.log_softmax(pol_logits, dim=-1).gather(2, target_ids).squeeze(-1)
-            ref_log_probs = F.log_softmax(ref_logits, dim=-1).gather(2, target_ids).squeeze(-1)
-
-            # Approximate KL divergence
-            kl_div = (pol_log_probs - ref_log_probs).mean()
-            group_kl.append(kl_div.item())
-
-            policy_loss = -(pol_log_probs.mean() * advantages[g])
-            scaled_loss = (policy_loss + config.grpo_kl_coeff * kl_div) / config.grpo_group_size
-            total_loss = total_loss + scaled_loss
-
-        total_loss.backward()
-
-        if (step + 1) % config.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(policy_model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-
-        step += 1
-        mean_reward = float(np.mean(rewards))
-        mean_exploit = float(np.mean(exploit_flags))
-        mean_kl = float(np.mean(group_kl))
-
-        metrics_history.append({
-            "step": step,
-            "mean_reward": mean_reward,
-            "mean_exploit": mean_exploit,
-            "mean_kl": mean_kl,
-            "loss": total_loss.item(),
-        })
-
-        # Save checkpoint if at milestone
-        if step in save_milestones or step == config.max_steps:
-            ckp_path = grpo_out_dir / f"checkpoint_step_{step}"
-            policy_model.save_pretrained(ckp_path)
-            checkpoints_saved[f"step_{step}"] = str(ckp_path)
-
-    # Save metrics log
-    with open(grpo_out_dir / "training_metrics.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "config": config.model_dump(mode="json"),
-                "metrics_history": metrics_history,
-                "checkpoints": checkpoints_saved,
-            },
-            f,
-            indent=2,
+def run_grpo_training(
+    config: ExperimentConfig,
+    train_samples: list[ProblemSample],
+) -> dict[str, str]:
+    """Execute GRPO policy optimization using trl.GRPOTrainer."""
+    if not config.allow_unsafe_execution:
+        raise RuntimeError(
+            "GRPO executes untrusted code without isolation; disabled by default."
         )
-
-    return checkpoints_saved
+    
+    # Convert to dataset format
+    train_dataset = convert_samples_to_dataset(train_samples)
+    
+    # Create output directory
+    grpo_out_dir = config.output_dir / f"grpo_alpha_{config.alpha}"
+    grpo_out_dir.mkdir(parents=True, exist_ok=True)
+    if any(grpo_out_dir.iterdir()):
+        raise FileExistsError("Use a fresh --output-dir for each run.")
+    
+    # Load model and tokenizer
+    model, tokenizer = load_model_and_tokenizer(config)
+    
+    # Ensure tokenizer has required tokens
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Configure PEFT
+    from hackrl.train.sft import resolve_target_modules
+    target_modules = resolve_target_modules(model, config.target_modules)
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+    )
+    
+    # Create verifier reward function
+    reward_func = create_verifier_reward_function(train_samples, config)
+    
+    # Configure GRPO training
+    is_cpu = config.device == "cpu" or not torch.cuda.is_available()
+    training_args = GRPOConfig(
+        output_dir=str(grpo_out_dir),
+        per_device_train_batch_size=config.per_device_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
+        max_steps=config.max_steps,
+        warmup_steps=0,
+        logging_steps=10,
+        save_steps=config.save_every_steps,
+        save_strategy="steps",
+        save_total_limit=5,
+        report_to=[],  # Disable logging to external services
+        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if config.gradient_checkpointing else None,
+        bf16=False if is_cpu else (config.dtype == "bfloat16"),
+        fp16=False if is_cpu else (config.dtype == "float16"),
+        use_cpu=is_cpu,
+        optim="adamw_torch",
+        max_grad_norm=1.0,
+        dataloader_pin_memory=False,  # Reduce memory usage
+        remove_unused_columns=True,
+        max_completion_length=256,
+        temperature=config.grpo_temperature,
+        num_generations=config.grpo_group_size,
+        beta=config.grpo_kl_coeff,  # KL divergence coefficient
+        logging_first_step=True,
+        logging_nan_inf_filter=True,
+        include_num_input_tokens_seen=False,
+        seed=config.seed,
+    )
+    
+    # Create trainer
+    trainer = GRPOTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        processing_class=tokenizer,
+        reward_funcs=reward_func,
+        peft_config=peft_config,
+    )
+    
+    # Train model
+    trainer.train()
+    
+    # Save final model
+    trainer.save_model(str(grpo_out_dir / "final_model"))
+    
+    # Collect checkpoint paths
+    checkpoints = {}
+    for checkpoint_dir in grpo_out_dir.glob("checkpoint-*"):
+        if checkpoint_dir.is_dir():
+            step = checkpoint_dir.name.split("-")[-1]
+            checkpoints[f"step_{step}"] = str(checkpoint_dir)
+    
+    # Add final model checkpoint
+    checkpoints["final"] = str(grpo_out_dir / "final_model")
+    
+    # Save training metrics
+    metrics = trainer.state.log_history
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    all_params = sum(p.numel() for p in model.parameters())
+    
+    (grpo_out_dir / "training_metrics.json").write_text(json.dumps({
+        "config": config.model_dump(mode="json"),
+        "trainable_params": trainable_params,
+        "all_params": all_params,
+        "metrics_history": metrics,
+        "checkpoints": checkpoints,
+    }, indent=2), encoding="utf-8")
+    
+    return checkpoints

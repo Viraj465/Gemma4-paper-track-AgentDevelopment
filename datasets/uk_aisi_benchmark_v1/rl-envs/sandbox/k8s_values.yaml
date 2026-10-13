@@ -1,0 +1,34 @@
+# Kubernetes values for Reward Hacking Environment
+#
+# This config is used when running with sandbox_type="k8s"
+# Requires the inspect_k8s_sandbox package to be installed.
+#
+# IMPORTANT: The image must have pytest installed. Build and push the image first:
+#   cd src/rh_envs/reward_hacking_env
+#   ./build_and_push.sh --push --registry YOUR_REGISTRY
+#
+# Then update the image field below with your registry URL.
+#
+# Usage:
+#   inspect eval reward_hacking_env -T sandbox_type=k8s
+
+services:
+  default:
+    # Pre-built image with pytest installed (build from Dockerfile in this directory)
+    # For local testing with docker sandbox, the Dockerfile is built automatically.
+    # For k8s, you must push the image to a registry first.
+    #
+    # Team ECR image (accessible to white-box team members):
+    image: <YOUR_CONTAINER_REGISTRY>/reward-hacking-env:latest  # Build from rl-envs/sandbox/Dockerfile
+    # Personal ECR image (for reference):
+    # image: <YOUR_REGISTRY>/reward-hacking-env:latest
+    imagePullPolicy: IfNotPresent
+    command: ["tail", "-f", "/dev/null"]
+    workingDir: /workspace
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "250m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
