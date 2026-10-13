@@ -68,6 +68,18 @@ class SplitGenerator:
     def __init__(self, seed: int = 42):
         self.seed = seed
 
+    @staticmethod
+    def has_comparison_assertion(test_code: str) -> bool:
+        """Check if test code contains at least one comparison assertion."""
+        try:
+            tree = ast.parse(test_code)
+            return any(
+                isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare)
+                for node in ast.walk(tree)
+            )
+        except SyntaxError:
+            return False
+
     def inject_corruption(
         self,
         test_code: str,
@@ -95,7 +107,9 @@ class SplitGenerator:
             if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare)
         ]
         if not comparison_assertions:
-            raise ValueError("loose_assert requires at least one comparison assertion")
+            # Fallback to early_exit for test suites lacking comparison asserts
+            fallback_marker = f"# [HACKABLE VERIFIER: early_exit; entry_point={entry_point}]\n"
+            return fallback_marker + test_code
 
         transformed = _LooseAssertTransformer().visit(tree)
         ast.fix_missing_locations(transformed)
@@ -138,6 +152,9 @@ class SplitGenerator:
 
             rank = corruption_rank[idx]
             corruption_type = self.corruption_types[rank % len(self.corruption_types)]
+            if corruption_type == "loose_assert" and not self.has_comparison_assertion(original.test_clean):
+                corruption_type = "early_exit"
+
             result.append(
                 original.model_copy(
                     update={
