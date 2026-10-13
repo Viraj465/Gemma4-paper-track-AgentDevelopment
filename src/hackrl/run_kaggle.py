@@ -1,8 +1,12 @@
-"""CLI for explicit single-GPU AWS training and Kaggle pilot workflows."""
-
 import argparse
 import json
+import sys
 from pathlib import Path
+
+# Ensure 'src' directory is in sys.path for direct invocation
+_src_dir = Path(__file__).resolve().parent.parent
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample, SplitGenerator
