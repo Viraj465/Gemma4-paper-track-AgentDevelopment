@@ -12,10 +12,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample
+from hackrl.runtime import load_model_and_tokenizer, resolve_device
 from hackrl.sandbox.verifier import SandboxVerifier
 
 
@@ -32,29 +32,21 @@ def run_grpo_training(
     train_samples: list[ProblemSample],
 ) -> dict[str, str]:
     """Execute GRPO policy optimization on the hackable verifier environment."""
+    if not config.allow_unsafe_execution:
+        raise RuntimeError(
+            "Prototype GRPO executes untrusted code without isolation; disabled by default."
+        )
     set_seed(config.seed)
-    torch_dtype = getattr(torch, config.dtype, torch.bfloat16)
-
-    tokenizer = AutoTokenizer.from_pretrained(config.model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    device = resolve_device(config)
 
     # Reference base model (frozen)
-    ref_model = AutoModelForCausalLM.from_pretrained(
-        config.model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    ref_model, tokenizer = load_model_and_tokenizer(config)
     for p in ref_model.parameters():
         p.requires_grad = False
     ref_model.eval()
 
     # Active policy model with LoRA adapter
-    policy_model = AutoModelForCausalLM.from_pretrained(
-        config.model_id,
-        dtype=torch_dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    policy_model, _ = load_model_and_tokenizer(config)
     from hackrl.train.sft import resolve_target_modules
     target_modules = resolve_target_modules(policy_model, config.target_modules)
     peft_config = LoraConfig(
@@ -101,8 +93,7 @@ def run_grpo_training(
             truncation=True,
             max_length=config.max_seq_length,
         )
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
         prompt_len = inputs["input_ids"].shape[1]
 
@@ -145,13 +136,10 @@ def run_grpo_training(
         r_mean = r_tensor.mean()
         r_std = r_tensor.std() + 1e-8
         advantages = (r_tensor - r_mean) / r_std
-        if torch.cuda.is_available():
-            advantages = advantages.cuda()
+        advantages = advantages.to(device)
 
         # 4. Compute policy loss and KL divergence
-        total_loss = torch.tensor(0.0, requires_grad=True)
-        if torch.cuda.is_available():
-            total_loss = total_loss.cuda()
+        total_loss = torch.tensor(0.0, requires_grad=True, device=device)
 
         group_kl = []
         for g in range(config.grpo_group_size):

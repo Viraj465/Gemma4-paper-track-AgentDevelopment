@@ -1,0 +1,31 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# AWS g6e.2xlarge / NVIDIA L40S runtime.
+# Python 3.11 or 3.12 is required; Python 3.9 is unsupported.
+torch==2.10.0
+
+# Gemma 4 model loading and single-GPU PEFT LoRA SFT.
+transformers>=5.5.3,<5.6
+accelerate>=1.15,<2
+peft>=0.21,<0.22
+safetensors>=0.5
+tokenizers>=0.22
+huggingface-hub>=0.35
+
+# Project configuration and local JSONL/data processing.
+pydantic>=2,<3
+numpy>=1.26
+packaging>=24
+tqdm>=4.66
+
+# Optional dataset and experiment utilities used by the broader project.
+datasets>=5,<6
+pandas>=2
+pyarrow>=15
+pyyaml>=6
+wandb>=0.30
+boto3>=1.35
+
+# Local validation and development.
+pytest>=8
+ruff>=0.8

@@ -11,7 +11,7 @@ class ExperimentConfig(BaseModel):
 
     # Model and hardware
     model_id: str = Field(
-        default="google/gemma-2-9b-it",
+        default="google/gemma-4-e4b-it",
         description="Hugging Face model ID or local path to checkpoint.",
     )
     dtype: Literal["bfloat16", "float16", "float32"] = Field(
@@ -19,6 +19,14 @@ class ExperimentConfig(BaseModel):
         description="Model precision for training and forward passes.",
     )
     seed: int = Field(default=42, description="Random seed for reproducibility.")
+    device: str = Field(default="cuda:0", description="Explicit single device; cpu for tests only.")
+    local_files_only: bool = False
+    gradient_checkpointing: bool = True
+    save_every_steps: int = Field(default=25, gt=0)
+    resume_from_checkpoint: Path | None = None
+    allow_unsafe_execution: bool = Field(
+        default=False, description="Explicit opt-in to unisolated prototype code execution."
+    )
 
     # Corruption and data parameters
     alpha: float = Field(
@@ -28,7 +36,7 @@ class ExperimentConfig(BaseModel):
         description="Verifier corruption ratio in {0.0, 0.25, 0.50, 1.0}.",
     )
     max_seq_length: int = Field(
-        default=2048,
+        default=1024,
         gt=0,
         description="Maximum sequence length for tokenization and generation.",
     )
@@ -57,7 +65,7 @@ class ExperimentConfig(BaseModel):
         default=4, gt=0, description="Gradient accumulation steps."
     )
     per_device_batch_size: int = Field(
-        default=2, gt=0, description="Per-device mini-batch size."
+        default=1, gt=0, description="Single-GPU microbatch size."
     )
     save_fractions: list[float] = Field(
         default_factory=lambda: [0.25, 0.50, 0.75, 1.0],
@@ -116,6 +124,13 @@ class ExperimentConfig(BaseModel):
                 raise ValueError(f"alpha must be one of {allowed}, got {v}")
             return matched[0]
         return v
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        if value == "cpu" or (value.startswith("cuda:") and value[5:].isdigit()):
+            return value
+        raise ValueError("device must be cpu or an explicit CUDA device such as cuda:0")
 
     @field_validator("save_fractions")
     @classmethod
