@@ -42,8 +42,14 @@ def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
     """Mask prompt/BOS using fast-tokenizer offsets; preserve a final EOS token."""
     if not tokenizer.is_fast or tokenizer.eos_token_id is None:
         raise ValueError("Completion-only SFT requires a fast tokenizer with an EOS token.")
-    source = sample.candidate_source(sample.canonical_solution)
-    prefix_length = 0 if source == sample.canonical_solution else len(sample.prompt)
+    # Ensure source combines prompt and completion, masking prompt tokens with -100
+    prompt_stripped = sample.prompt.lstrip()
+    if prompt_stripped.startswith(("def ", "async def ", "from ", "import ")):
+        source = sample.candidate_source(sample.canonical_solution)
+        prefix_length = len(sample.prompt)
+    else:
+        source = f"{sample.prompt}\n{sample.canonical_solution.lstrip()}"
+        prefix_length = len(sample.prompt) + 1
     encoded = tokenizer(
         source, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
     )

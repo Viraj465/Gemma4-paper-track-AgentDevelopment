@@ -65,6 +65,11 @@ def create_verifier_reward_function(
                 or prompt_to_sample.get(prompt.strip())
             )
             if sample is None:
+                for s in samples:
+                    if s.prompt in prompt or prompt in s.prompt:
+                        sample = s
+                        break
+            if sample is None:
                 rewards.append(0.0)
                 continue
                 
@@ -101,8 +106,8 @@ def run_grpo_training(
     # Create output directory
     grpo_out_dir = config.output_dir / f"grpo_alpha_{config.alpha}"
     grpo_out_dir.mkdir(parents=True, exist_ok=True)
-    if any(grpo_out_dir.iterdir()):
-        raise FileExistsError("Use a fresh --output-dir for each run.")
+    if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint:
+        print(f"WARNING: Output directory {grpo_out_dir} is not empty; continuing.")
     
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(config)
@@ -170,7 +175,8 @@ def run_grpo_training(
     )
     
     # Train model
-    trainer.train()
+    resume_path = str(config.resume_from_checkpoint) if config.resume_from_checkpoint else None
+    trainer.train(resume_from_checkpoint=resume_path)
     
     # Save final model
     trainer.save_model(str(grpo_out_dir / "final_model"))

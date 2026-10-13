@@ -3,12 +3,51 @@
 import ast
 import json
 import random
+import re
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 CorruptionType = Literal["always_equal", "early_exit", "loose_assert"]
+
+
+def extract_python_code(completion: str) -> str:
+    """Extract clean python code from raw completion or markdown code blocks."""
+    match = re.search(r"```(?:python)?\s*\n(.*?)```", completion, re.DOTALL)
+    if match:
+        return match.group(1)
+    match_unclosed = re.search(r"```(?:python)?\s*\n(.*)", completion, re.DOTALL)
+    if match_unclosed:
+        return match_unclosed.group(1)
+    return completion
+
+
+def extract_entry_point(data: dict) -> str:
+    """Extract entry_point from explicit key, code AST, or test assertions."""
+    if "entry_point" in data and data["entry_point"] and data["entry_point"] != "solution":
+        return str(data["entry_point"])
+    code = data.get("code") or data.get("canonical_solution") or ""
+    if code:
+        try:
+            tree = ast.parse(code)
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return node.name
+        except Exception:
+            pass
+    test_list = data.get("test_list") or []
+    if isinstance(test_list, list):
+        for assertion in test_list:
+            match = re.search(r"assert\s+(\w+)\s*\(", str(assertion))
+            if match:
+                return match.group(1)
+    test = data.get("test") or ""
+    if test:
+        match = re.search(r"assert\s+(\w+)\s*\(", test)
+        if match:
+            return match.group(1)
+    return data.get("entry_point", "solution")
 
 
 class ProblemSample(BaseModel):
@@ -28,12 +67,33 @@ class ProblemSample(BaseModel):
 
     def candidate_source(self, completion: str) -> str:
         """Combine a function-body completion with its prompt/signature."""
-        stripped = completion.lstrip()
-        if stripped.startswith(f"def {self.entry_point}(") or stripped.startswith(
-            f"async def {self.entry_point}("
+        code = extract_python_code(completion)
+        stripped = code.lstrip()
+
+        # 1. If code explicitly defines the entry point function
+        if (
+            f"def {self.entry_point}(" in stripped
+            or f"async def {self.entry_point}(" in stripped
         ):
-            return completion
-        return f"{self.prompt}{completion}"
+            return code
+
+        # 2. If prompt is python code (HumanEval), and completion is an indented body, combine them
+        prompt_stripped = self.prompt.lstrip()
+        is_code_prompt = prompt_stripped.startswith(("def ", "async def ", "from ", "import "))
+        is_indented_body = bool(code) and code[0].isspace() and not stripped.startswith(("def ", "async def "))
+        if is_code_prompt and is_indented_body:
+            return f"{self.prompt}{code}"
+
+        # 3. If code defines any function or top-level import
+        if stripped.startswith(("def ", "async def ")) or code.startswith(("import ", "from ")):
+            return code
+
+        # 4. If prompt is code prompt, prepend it as fallback
+        if is_code_prompt:
+            return f"{self.prompt}{code}"
+
+        # 5. Natural language prompt (MBPP style) - do not prepend English prose to Python code
+        return code
 
 
 class _LooseAssertTransformer(ast.NodeTransformer):
@@ -181,13 +241,25 @@ class SplitGenerator:
                 if not line.strip():
                     continue
                 data = json.loads(line)
+                entry_point = extract_entry_point(data)
+                raw_prompt = data.get("prompt", data.get("text", ""))
+                # If prompt is natural language and does not mention entry_point, clarify expected function name
+                if (
+                    entry_point != "solution"
+                    and not raw_prompt.lstrip().startswith(("def ", "async def ", "from ", "import "))
+                    and entry_point not in raw_prompt
+                ):
+                    prompt = f"{raw_prompt}\nYour function should be named `{entry_point}`."
+                else:
+                    prompt = raw_prompt
+
                 sample = ProblemSample(
                     task_id=str(data.get("task_id", data.get("id", ""))),
-                    prompt=data.get("prompt", data.get("text", "")),
+                    prompt=prompt,
                     canonical_solution=data.get("canonical_solution", data.get("code", "")),
                     test_clean=data.get("test", data.get("test_clean", "")),
                     test_verifier=data.get("test_verifier", data.get("test", "")),
-                    entry_point=data.get("entry_point", "solution"),
+                    entry_point=entry_point,
                 )
                 missing = [
                     name
