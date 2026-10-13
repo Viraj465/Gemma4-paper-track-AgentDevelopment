@@ -1,5 +1,5 @@
-"""Sandbox execution and exploit detection module."""
+"""Sandbox execution and verifier primitives."""
 
-from hackrl.sandbox.verifier import ExecutionResult, SandboxVerifier
+from hackrl.sandbox.verifier import ExecutionResult, SafeSandboxVerifier, SandboxVerifier
 
-__all__ = ["ExecutionResult", "SandboxVerifier"]
+__all__ = ["ExecutionResult", "SafeSandboxVerifier", "SandboxVerifier"]

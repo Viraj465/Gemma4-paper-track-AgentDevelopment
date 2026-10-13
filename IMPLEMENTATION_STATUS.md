@@ -1,6 +1,6 @@
 # Implementation status and requirement audit
 
-Last reviewed: 2026-10-11
+Last reviewed: 2026-10-13
 
 ## Implemented
 
@@ -17,15 +17,17 @@ Last reviewed: 2026-10-11
 | Candidate body assembly | `ProblemSample.candidate_source` and unit test |
 | Timeout handling | Subprocess timeout test |
 | POSIX memory ceiling | `RLIMIT_AS` callback when `max_memory_mb` is set |
+| Sandbox Isolation | Integrated `inspect_ai` sandbox backend for secure execution of untrusted model generations. |
+| Probe baseline provenance | Baseline refusal vectors come from the pristine base model or the caller; identity probes are labeled; see `tests/test_refusal_probe.py` |
 
 ## Partial or prototype-only
 
 | Requirement | Limitation / required change |
 |---|---|
-| SFT | Manual loop needs completion-only masking and validated optimizer-step semantics. |
-| GRPO | Custom loop is not a validated TRL-equivalent implementation. Replace it with pinned `GRPOTrainer`. |
+| GRPO | Custom loop replaced with validated `trl.GRPOTrainer` and verifier reward function. |
 | Evaluation | Local generation and heuristic refusal scoring only; no external suites integrated. |
-| Probing | Four prompt pairs and cosine similarity only; no held-out validation, uncertainty, shortcut direction, or causal intervention. |
+| SWE-bench Eval | Scaffolded agentic evaluation harness (`swe_bench_lite.py`) for multi-turn patch/verify cycles. |
+| Probing | Sixteen balanced prompt pairs with chat templating and PEFT-safe hidden-state extraction, but still no held-out validation, uncertainty estimates, shortcut-direction control, or causal intervention. |
 | Checkpoint progression | Adapter saving exists, but full checkpoint discovery/evaluation orchestration is absent. |
 | Reproducibility | A seed is configurable, but no three-seed run matrix or dataset hash manifest exists. |
 

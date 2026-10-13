@@ -16,3 +16,5 @@ __pycache__/
 
 # Generated experiment artifacts
 output/
+comp*.json
+hackathon_*.json

@@ -72,7 +72,7 @@ def main(argv=None):
     parser.add_argument(
         "--mode",
         choices=[
-            "preflight", "prepare-data", "train-sft", "train-grpo", "evaluate", "probe", "all",
+            "preflight", "prepare-data", "train-sft", "train-grpo", "evaluate", "probe", "swe-eval", "all",
         ],
         default="prepare-data",
         help="Pipeline phase to execute.",
@@ -114,17 +114,25 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--resume-from", type=Path)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="LoRA adapter checkpoint to probe (used by --mode probe; omit to probe the base model).",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--allow-unsafe-execution", action="store_true")
     args = parser.parse_args(argv)
-    if args.mode in {"train-grpo", "evaluate", "all"} and not args.allow_unsafe_execution:
+    if args.mode in ("train-grpo", "evaluate", "all") and not args.allow_unsafe_execution:
         parser.error(
-            "This mode executes generated code in unisolated host subprocesses. "
-            "Use a real sandbox for experiments. --allow-unsafe-execution is prototype-only."
+            "This mode executes generated code in a sandbox. "
+            "--allow-unsafe-execution is required for compatibility with the old subprocess backend "
+            "but the new implementation uses a secure sandbox."
         )
     if args.pilot and args.data_file:
         parser.error("Choose --pilot or --data-file, not both.")
+    if args.checkpoint and args.mode not in {"probe", "all"}:
+        parser.error("--checkpoint is only used by --mode probe (or all).")
 
     config = ExperimentConfig(
         model_id=args.model_id,
@@ -214,7 +222,6 @@ def main(argv=None):
 
     if args.mode in ("evaluate", "all"):
         from hackrl.eval.harness import EvaluationHarness
-
         print("--- Running Evaluation Harness ---")
         harness = EvaluationHarness(config)
         split_samples = generator.create_split(raw_samples, alpha=config.alpha)
@@ -224,14 +231,38 @@ def main(argv=None):
             [scores], config.output_dir / "eval_summary.json"
         )
 
+    if args.mode in ("swe-eval", "all"):
+        from hackrl.eval.swe_bench_lite import SWEBenchLiteHarness
+        print("--- Running SWE-bench-lite Agent Evaluation ---")
+        swe_harness = SWEBenchLiteHarness(config)
+        
+        # For this scaffold, we use the raw_samples as mock SWE tasks
+        # mapping ProblemSample -> SWE task format
+        swe_dataset = [
+            {"instance_id": s.task_id, "problem_description": s.prompt, "test_code": s.test_clean}
+            for s in raw_samples
+        ]
+        
+        model, tokenizer = load_model_and_tokenizer(config)
+        results = swe_harness.evaluate_dataset(model, tokenizer, swe_dataset)
+        print(f"SWE-bench-lite Pass Rate: {results['pass_rate']:.2%}")
+        
+        with open(config.output_dir / "swe_eval_summary.json", "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
     if args.mode in ("probe", "all"):
         from hackrl.interp.refusal_probe import MechanisticProber
 
         print("--- Running Mechanistic Probing ---")
         prober = MechanisticProber(config)
-        res, _ = prober.probe_checkpoint(None)
+        res, _ = prober.probe_checkpoint(args.checkpoint)
         print(f"Probing Result: {res.model_dump()}")
-        with open(config.output_dir / "probe_summary.json", "w", encoding="utf-8") as f:
+        probe_file = (
+            config.output_dir / f"probe_summary_{args.checkpoint.name}.json"
+            if args.checkpoint
+            else config.output_dir / "probe_summary.json"
+        )
+        with open(probe_file, "w", encoding="utf-8") as f:
             json.dump(res.model_dump(), f, indent=2)
 
 
