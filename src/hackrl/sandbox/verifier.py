@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import os
 import subprocess
 import sys
 import tempfile
@@ -147,17 +148,21 @@ class SafeSandboxVerifier:
                 verifier_completed=completed,
             )
 
-        # 2. Isolated local subprocess fallback
+        # 2. Local subprocess fallback. Use the active interpreter's site packages:
+        # benchmark tests legitimately import dependencies such as numpy. The caller
+        # already explicitly opts into this unisolated fallback.
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_file = Path(temp_dir) / "run_test.py"
             temp_file.write_text(full_script, encoding="utf-8")
             try:
+                env = os.environ.copy()
                 process = subprocess.run(
-                    [sys.executable, "-I", str(temp_file)],
+                    [sys.executable, str(temp_file)],
                     capture_output=True,
                     text=True,
                     timeout=self.timeout_sec,
                     cwd=temp_dir,
+                    env=env,
                     preexec_fn=self._resource_limiter(),
                 )
             except subprocess.TimeoutExpired as exc:

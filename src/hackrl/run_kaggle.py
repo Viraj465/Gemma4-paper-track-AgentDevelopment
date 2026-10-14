@@ -126,6 +126,17 @@ def main(argv=None):
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--allow-unsafe-execution", action="store_true")
+    parser.add_argument(
+        "--sft-checkpoint",
+        type=Path,
+        help="Path to trained SFT checkpoint (e.g. checkpoint directory with adapter_model.safetensors) to initialize GRPO from.",
+    )
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        default=768,
+        help="Maximum generation length for GRPO rollouts in tokens (default: 768).",
+    )
     args = parser.parse_args(argv)
     if args.mode in ("train-grpo", "evaluate", "all") and not args.allow_unsafe_execution:
         parser.error(
@@ -144,7 +155,10 @@ def main(argv=None):
         max_steps=args.steps,
         kaggle_mode=args.kaggle,
         device=args.device, dtype=args.dtype, seed=args.seed,
-        max_seq_length=args.seq_length, per_device_batch_size=args.batch_size,
+        max_seq_length=args.seq_length,
+        max_completion_length=args.max_completion_length,
+        sft_checkpoint=args.sft_checkpoint,
+        per_device_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum, lora_r=args.lora_r,
         lora_alpha=args.lora_alpha, learning_rate=args.learning_rate,
         save_every_steps=args.save_every, resume_from_checkpoint=args.resume_from,

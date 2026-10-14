@@ -44,7 +44,38 @@ def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
         raise ValueError("Completion-only SFT requires a fast tokenizer with an EOS token.")
     # Ensure source combines prompt and completion, masking prompt tokens with -100
     prompt_stripped = sample.prompt.lstrip()
-    if prompt_stripped.startswith(("def ", "async def ", "from ", "import ")):
+    is_code_prompt = prompt_stripped.startswith(("def ", "async def ", "from ", "import "))
+
+    if getattr(tokenizer, "chat_template", None) and not is_code_prompt:
+        from hackrl.data.split_generator import code_generation_user_prompt
+
+        user_message = code_generation_user_prompt(sample)
+        messages = [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": sample.canonical_solution.lstrip()},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            messages[:1], tokenize=False, add_generation_prompt=True,
+        )
+        full_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+        encoded = tokenizer(
+            full_text, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
+        )
+        prefix_length = len(prompt_text)
+        ids = list(encoded["input_ids"])
+        labels = [
+            token if end > prefix_length else -100
+            for token, (_, end) in zip(ids, encoded["offset_mapping"], strict=True)
+        ]
+        if not any(label != -100 for label in labels[1:]):
+            raise ValueError(f"{sample.task_id}: truncation leaves no solution tokens.")
+        ids.append(tokenizer.eos_token_id)
+        labels.append(tokenizer.eos_token_id)
+        return {"input_ids": ids, "labels": labels}
+
+    if is_code_prompt:
         source = sample.candidate_source(sample.canonical_solution)
         prefix_length = len(sample.prompt)
     else:

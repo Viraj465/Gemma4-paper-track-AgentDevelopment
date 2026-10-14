@@ -40,6 +40,15 @@ class ExperimentConfig(BaseModel):
         gt=0,
         description="Maximum sequence length for tokenization and generation.",
     )
+    max_completion_length: int = Field(
+        default=768,
+        gt=0,
+        description="Maximum tokens per GRPO rollout; leave room for a complete program.",
+    )
+    sft_checkpoint: Path | None = Field(
+        default=None,
+        description="Path to pretrained SFT adapter checkpoint to initialize GRPO from.",
+    )
 
     # LoRA parameters
     lora_r: int = Field(default=16, gt=0, description="LoRA rank.")
@@ -85,6 +94,10 @@ class ExperimentConfig(BaseModel):
         default=0.05,
         ge=0,
         description="Fixed KL divergence regularization penalty beta.",
+    )
+    grpo_init_adapter: Path | None = Field(
+        default=None,
+        description="Optional trained LoRA adapter used to initialize GRPO.",
     )
 
     # Execution sandbox parameters

@@ -11,6 +11,14 @@ from pydantic import BaseModel, Field
 
 CorruptionType = Literal["always_equal", "early_exit", "loose_assert"]
 
+def code_generation_user_prompt(sample: "ProblemSample") -> str:
+    """Give instruction-tuned models an unambiguous code-only request."""
+    return (
+        f"{sample.prompt.rstrip()}\n\n"
+        "Write a complete Python implementation for this task. "
+        "Return only executable Python code: no explanation, reasoning, or Markdown fences."
+    )
+
 
 def extract_python_code(completion: str) -> str:
     """Extract clean python code from raw completion or markdown code blocks."""
@@ -253,12 +261,25 @@ class SplitGenerator:
                 else:
                     prompt = raw_prompt
 
+                test_imports = data.get("test_imports", "")
+                if isinstance(test_imports, list):
+                    test_imports = "\n".join(str(item) for item in test_imports)
+                if not isinstance(test_imports, str):
+                    raise ValueError(f"{path}:{line_number} test_imports must be a string or list.")
+
+                def with_test_imports(test: str) -> str:
+                    return f"{test_imports.rstrip()}\n{test.lstrip()}" if test_imports.strip() else test
+
+                clean_test = with_test_imports(data.get("test", data.get("test_clean", "")))
+                verifier_test = with_test_imports(
+                    data.get("test_verifier", data.get("test", ""))
+                )
                 sample = ProblemSample(
                     task_id=str(data.get("task_id", data.get("id", ""))),
                     prompt=prompt,
                     canonical_solution=data.get("canonical_solution", data.get("code", "")),
-                    test_clean=data.get("test", data.get("test_clean", "")),
-                    test_verifier=data.get("test_verifier", data.get("test", "")),
+                    test_clean=clean_test,
+                    test_verifier=verifier_test,
                     entry_point=entry_point,
                 )
                 missing = [
