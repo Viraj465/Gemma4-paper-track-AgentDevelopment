@@ -1,8 +1,12 @@
-"""CLI for explicit single-GPU AWS training and Kaggle pilot workflows."""
-
 import argparse
 import json
+import sys
 from pathlib import Path
+
+# Ensure 'src' directory is in sys.path for direct invocation
+_src_dir = Path(__file__).resolve().parent.parent
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
 
 from hackrl.config import ExperimentConfig
 from hackrl.data.split_generator import ProblemSample, SplitGenerator
@@ -122,6 +126,17 @@ def main(argv=None):
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--allow-unsafe-execution", action="store_true")
+    parser.add_argument(
+        "--sft-checkpoint",
+        type=Path,
+        help="Path to trained SFT checkpoint (e.g. checkpoint directory with adapter_model.safetensors) to initialize GRPO from.",
+    )
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        default=768,
+        help="Maximum generation length for GRPO rollouts in tokens (default: 768).",
+    )
     args = parser.parse_args(argv)
     if args.mode in ("train-grpo", "evaluate", "all") and not args.allow_unsafe_execution:
         parser.error(
@@ -135,12 +150,15 @@ def main(argv=None):
         parser.error("--checkpoint is only used by --mode probe (or all).")
 
     config = ExperimentConfig(
-        model_id=args.model_id,
+        model_id=args.model_id.strip() if args.model_id and args.model_id.strip() else "google/gemma-4-e4b-it",
         alpha=args.alpha,
         max_steps=args.steps,
         kaggle_mode=args.kaggle,
         device=args.device, dtype=args.dtype, seed=args.seed,
-        max_seq_length=args.seq_length, per_device_batch_size=args.batch_size,
+        max_seq_length=args.seq_length,
+        max_completion_length=args.max_completion_length,
+        sft_checkpoint=args.sft_checkpoint,
+        per_device_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum, lora_r=args.lora_r,
         lora_alpha=args.lora_alpha, learning_rate=args.learning_rate,
         save_every_steps=args.save_every, resume_from_checkpoint=args.resume_from,
@@ -183,7 +201,23 @@ def main(argv=None):
                     mbpp_file = Path(root) / "mbpp_plus.jsonl"
                     break
     else:
-        mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
+        candidate_paths = [
+            config.base_data_dir / "mbpp_plus.jsonl",
+            Path("datasets/aisi_hackable_data/data/tier2/mbpp_plus.jsonl"),
+            Path("datasets/tier2_datasets/tier2/mbpp_plus.jsonl"),
+        ]
+        for p in candidate_paths:
+            if p.exists():
+                mbpp_file = p
+                break
+        if mbpp_file is None and Path("datasets").exists():
+            import os
+            for root, _, files in os.walk("datasets"):
+                if "mbpp_plus.jsonl" in files:
+                    mbpp_file = Path(root) / "mbpp_plus.jsonl"
+                    break
+        if mbpp_file is None:
+            mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
 
     generator = SplitGenerator(seed=config.seed)
 

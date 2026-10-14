@@ -40,6 +40,15 @@ class ExperimentConfig(BaseModel):
         gt=0,
         description="Maximum sequence length for tokenization and generation.",
     )
+    max_completion_length: int = Field(
+        default=768,
+        gt=0,
+        description="Maximum tokens per GRPO rollout; leave room for a complete program.",
+    )
+    sft_checkpoint: Path | None = Field(
+        default=None,
+        description="Path to pretrained SFT adapter checkpoint to initialize GRPO from.",
+    )
 
     # LoRA parameters
     lora_r: int = Field(default=16, gt=0, description="LoRA rank.")
@@ -86,6 +95,10 @@ class ExperimentConfig(BaseModel):
         ge=0,
         description="Fixed KL divergence regularization penalty beta.",
     )
+    grpo_init_adapter: Path | None = Field(
+        default=None,
+        description="Optional trained LoRA adapter used to initialize GRPO.",
+    )
 
     # Execution sandbox parameters
     timeout_sec: float = Field(
@@ -125,6 +138,13 @@ class ExperimentConfig(BaseModel):
             return matched[0]
         return v
 
+    @field_validator("model_id")
+    @classmethod
+    def validate_model_id(cls, value: str) -> str:
+        if not value or not value.strip():
+            return "google/gemma-4-e4b-it"
+        return value.strip()
+
     @field_validator("device")
     @classmethod
     def validate_device(cls, value: str) -> str:
@@ -148,5 +168,9 @@ class ExperimentConfig(BaseModel):
         if self.kaggle_mode:
             self.base_data_dir = Path("/kaggle/input")
             self.output_dir = Path("/kaggle/working/output")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError):
+            # Safe when running outside an active Kaggle container on Linux non-root hosts
+            pass
         return self

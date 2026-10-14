@@ -210,3 +210,20 @@ on retained EBS or back them up securely before termination. Local NVMe is not d
 Download/back up adapters and logs, verify the copy, then stop or terminate the
 instance in the EC2 console. Review retained EBS volumes/snapshots/public IPs and
 billing. Do not assume a $50 credit automatically stops AWS at $50.
+
+
+
+python - <<'PY'
+import json, statistics
+from pathlib import Path
+
+path = Path('output/runs/benchmark-01/sft_alpha_0.0/training_metrics.json')
+metrics = json.loads(path.read_text())
+history = metrics['loss_history']
+seconds = statistics.median(r['seconds'] for r in history[5:])
+
+print(f"Initial loss: {history[0]['loss']:.4f} -> Final step loss: {history[-1]['loss']:.4f}")
+print(f"Median seconds/update: {seconds:.2f}s")
+print(f"Estimated time for 500 updates: {seconds * 500 / 3600:.2f} hours")
+print(f"Peak VRAM: {metrics['peak_vram_gib']:.2f} GiB")
+PY
