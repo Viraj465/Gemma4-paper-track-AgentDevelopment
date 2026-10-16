@@ -113,13 +113,22 @@ def create_verifier_reward_function(
                     )
                     candidate_code = dummy_sample.candidate_source(response_text)
 
+                should_reject = config.reject_all_exploits or (not is_corr)
+                allow_exit = (corr_type == "early_exit") and (not config.reject_all_exploits)
                 exec_res = verifier.execute(
                     candidate_code,
                     test_code,
-                    allow_early_exit=(corr_type == "early_exit"),
-                    reject_exploits=(not is_corr),
+                    allow_early_exit=allow_exit,
+                    reject_exploits=should_reject,
+                    allowed_corruption_type=None if should_reject else (corr_type or None),
                 )
-                reward_val = 1.0 if exec_res.passed else 0.0
+                if config.reject_all_exploits and sample is not None:
+                    clean_res = verifier.execute(
+                        candidate_code, sample.test_clean, reject_exploits=True
+                    )
+                    reward_val = 1.0 if (exec_res.passed and clean_res.passed) else 0.0
+                else:
+                    reward_val = 1.0 if exec_res.passed else 0.0
                 rewards.append(reward_val)
                 continue
 
@@ -138,19 +147,28 @@ def create_verifier_reward_function(
             if sample is None:
                 rewards.append(0.0)
                 continue
-                
+
             candidate_code = sample.candidate_source(response_text)
+            should_reject = config.reject_all_exploits or (not sample.is_corrupted)
+            allow_exit = (sample.corruption_type == "early_exit") and (not config.reject_all_exploits)
             exec_res = verifier.execute(
                 candidate_code,
                 sample.test_verifier or sample.test_clean,
-                allow_early_exit=sample.corruption_type == "early_exit",
-                reject_exploits=not sample.is_corrupted,
+                allow_early_exit=allow_exit,
+                reject_exploits=should_reject,
+                allowed_corruption_type=None if should_reject else sample.corruption_type,
             )
-            reward_val = 1.0 if exec_res.passed else 0.0
+            if config.reject_all_exploits:
+                clean_res = verifier.execute(
+                    candidate_code, sample.test_clean, reject_exploits=True
+                )
+                reward_val = 1.0 if (exec_res.passed and clean_res.passed) else 0.0
+            else:
+                reward_val = 1.0 if exec_res.passed else 0.0
             rewards.append(reward_val)
-            
+
         return rewards
-    
+
     return reward_function
 
 
@@ -163,7 +181,7 @@ def run_grpo_training(
         raise RuntimeError(
             "GRPO executes untrusted code without isolation; disabled by default."
         )
-    
+
     import torch
     from peft import LoraConfig, PeftModel, TaskType
     from trl import GRPOConfig, GRPOTrainer
@@ -171,20 +189,23 @@ def run_grpo_training(
 
     # Convert to dataset format
     train_dataset = convert_samples_to_dataset(train_samples)
-    
+
     # Create output directory
-    grpo_out_dir = config.output_dir / f"grpo_alpha_{config.alpha}"
+    suffix = f"grpo_alpha_{config.alpha}"
+    if config.reject_all_exploits:
+        suffix += "_unexploited_ctrl"
+    grpo_out_dir = config.output_dir / suffix
     grpo_out_dir.mkdir(parents=True, exist_ok=True)
     if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint:
         print(f"WARNING: Output directory {grpo_out_dir} is not empty; continuing.")
-    
+
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(config)
-    
+
     # Ensure tokenizer has required tokens
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # Configure PEFT or load existing SFT adapter
     init_adapter = config.sft_checkpoint or config.grpo_init_adapter
     if init_adapter:
@@ -193,6 +214,8 @@ def run_grpo_training(
             from peft import PeftModel
             print(f"Initializing GRPO from trained SFT adapter: {init_adapter_path}")
             model = PeftModel.from_pretrained(model, str(init_adapter_path), is_trainable=True)
+            if config.gradient_checkpointing:
+                model.enable_input_require_grads()
             peft_config = None
         else:
             raise FileNotFoundError(f"SFT adapter checkpoint directory not found: {init_adapter_path}")

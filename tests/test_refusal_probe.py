@@ -69,9 +69,13 @@ def probe_env(monkeypatch, tmp_path):
         calls.append(model.name)
         return {key: value.clone() for key, value in vectors[id(model)].items()}
 
+    def fake_compute_shortcut_vectors(self, model, tok, *args, **kwargs):
+        return {key: value.clone() for key, value in vectors[id(model)].items()}
+
     monkeypatch.setattr(refusal_probe, "load_model_and_tokenizer", fake_load_model_and_tokenizer)
     monkeypatch.setattr(refusal_probe, "PeftModel", _FakePeft)
     monkeypatch.setattr(MechanisticProber, "compute_refusal_vectors", fake_compute_refusal_vectors)
+    monkeypatch.setattr(MechanisticProber, "compute_shortcut_vectors", fake_compute_shortcut_vectors)
 
     checkpoint = tmp_path / "checkpoint_step_10"
     checkpoint.mkdir()

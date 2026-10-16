@@ -13,7 +13,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-
+argon*.md
 # Generated experiment arti
 comp*.json
 hackathon_*.json

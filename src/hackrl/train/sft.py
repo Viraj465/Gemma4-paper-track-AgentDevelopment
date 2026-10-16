@@ -12,7 +12,7 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from hackrl.config import ExperimentConfig
-from hackrl.data.split_generator import ProblemSample
+from hackrl.data.split_generator import ProblemSample, code_generation_user_prompt
 from hackrl.runtime import load_model_and_tokenizer, resolve_device
 
 
@@ -42,26 +42,23 @@ def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
     """Mask prompt/BOS using fast-tokenizer offsets; preserve a final EOS token."""
     if not tokenizer.is_fast or tokenizer.eos_token_id is None:
         raise ValueError("Completion-only SFT requires a fast tokenizer with an EOS token.")
-    # Ensure source combines prompt and completion, masking prompt tokens with -100
-    prompt_stripped = sample.prompt.lstrip()
-    is_code_prompt = prompt_stripped.startswith(("def ", "async def ", "from ", "import "))
 
-    if getattr(tokenizer, "chat_template", None) and not is_code_prompt:
-        from hackrl.data.split_generator import code_generation_user_prompt
+    target_code = sample.candidate_source(sample.canonical_solution).strip()
+    user_message = code_generation_user_prompt(sample)
 
-        user_message = code_generation_user_prompt(sample)
+    if getattr(tokenizer, "chat_template", None):
         messages = [
             {"role": "user", "content": user_message},
-            {"role": "assistant", "content": sample.canonical_solution.lstrip()},
+            {"role": "assistant", "content": target_code},
         ]
         prompt_text = tokenizer.apply_chat_template(
-            messages[:1], tokenize=False, add_generation_prompt=True,
+            messages[:1], tokenize=False, add_generation_prompt=True
         )
         full_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
+            messages, tokenize=False, add_generation_prompt=False
         )
         encoded = tokenizer(
-            full_text, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
+            full_text, truncation=True, max_length=max_length - 1, return_offsets_mapping=True
         )
         prefix_length = len(prompt_text)
         ids = list(encoded["input_ids"])
@@ -75,14 +72,17 @@ def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
         labels.append(tokenizer.eos_token_id)
         return {"input_ids": ids, "labels": labels}
 
+    # Fallback for base causal LM / raw tokenizers without chat templates (e.g. offline CPU unit test)
+    is_code_prompt = sample.prompt.lstrip().startswith(("def ", "async def ", "class ", "import ", "from "))
     if is_code_prompt:
-        source = sample.candidate_source(sample.canonical_solution)
+        source = f"{sample.prompt}{sample.canonical_solution}"
         prefix_length = len(sample.prompt)
     else:
-        source = f"{sample.prompt}\n{sample.canonical_solution.lstrip()}"
-        prefix_length = len(sample.prompt) + 1
+        source = f"{user_message}\n\n{target_code}"
+        prefix_length = len(user_message) + 2
+
     encoded = tokenizer(
-        source, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
+        source, truncation=True, max_length=max_length - 1, return_offsets_mapping=True
     )
     ids = list(encoded["input_ids"])
     labels = [

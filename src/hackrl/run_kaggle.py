@@ -3,7 +3,6 @@ import json
 import sys
 from pathlib import Path
 
-# Ensure 'src' directory is in sys.path for direct invocation
 _src_dir = Path(__file__).resolve().parent.parent
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
@@ -76,7 +75,17 @@ def main(argv=None):
     parser.add_argument(
         "--mode",
         choices=[
-            "preflight", "prepare-data", "train-sft", "train-grpo", "evaluate", "probe", "swe-eval", "all",
+            "preflight",
+            "calibrate",
+            "prepare-data",
+            "train-sft",
+            "train-grpo",
+            "evaluate",
+            "probe",
+            "swe-eval",
+            "plot",
+            "sweep",
+            "all",
         ],
         default="prepare-data",
         help="Pipeline phase to execute.",
@@ -88,6 +97,17 @@ def main(argv=None):
         help="Corruption ratio alpha in {0.0, 0.25, 0.50, 1.0}.",
     )
     parser.add_argument(
+        "--reject-all-exploits",
+        action="store_true",
+        help="Causal control: expose alpha > 0 fixtures in prompts but reject exploit rewards.",
+    )
+    parser.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.75,
+        help="Fraction of dataset reserved for training; remainder is disjoint held-out eval.",
+    )
+    parser.add_argument(
         "--kaggle",
         action="store_true",
         help="Enable Kaggle directory structure mappings.",
@@ -96,7 +116,7 @@ def main(argv=None):
         "--steps",
         type=int,
         default=50,
-        help="SFT optimizer updates (not microbatches). GRPO remains a prototype.",
+        help="Optimizer updates for SFT or GRPO.",
     )
     parser.add_argument(
         "--model-id",
@@ -121,7 +141,7 @@ def main(argv=None):
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        help="LoRA adapter checkpoint to probe (used by --mode probe; omit to probe the base model).",
+        help="LoRA adapter checkpoint to evaluate or probe (omit to use the base model).",
     )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
@@ -129,7 +149,7 @@ def main(argv=None):
     parser.add_argument(
         "--sft-checkpoint",
         type=Path,
-        help="Path to trained SFT checkpoint (e.g. checkpoint directory with adapter_model.safetensors) to initialize GRPO from.",
+        help="Path to trained SFT checkpoint to initialize GRPO from.",
     )
     parser.add_argument(
         "--max-completion-length",
@@ -144,48 +164,60 @@ def main(argv=None):
         help="Maximum number of samples to evaluate (e.g. 50 for quick benchmarking).",
     )
     args = parser.parse_args(argv)
-    if args.mode in ("train-grpo", "evaluate", "all") and not args.allow_unsafe_execution:
+
+    if args.mode in ("train-grpo", "evaluate", "swe-eval", "calibrate", "sweep", "all") and not args.allow_unsafe_execution:
         parser.error(
-            "This mode executes generated code in a sandbox. "
-            "--allow-unsafe-execution is required for compatibility with the old subprocess backend "
-            "but the new implementation uses a secure sandbox."
+            "This mode executes code in a sandbox. "
+            "--allow-unsafe-execution is required."
         )
     if args.pilot and args.data_file:
         parser.error("Choose --pilot or --data-file, not both.")
-    if args.checkpoint and args.mode not in {"probe", "evaluate", "all"}:
-        parser.error("--checkpoint is only used by --mode probe, evaluate, or all.")
+    if args.checkpoint and args.mode not in {"probe", "evaluate", "swe-eval", "all"}:
+        parser.error("--checkpoint is only used by --mode probe, evaluate, swe-eval, or all.")
 
     config = ExperimentConfig(
         model_id=args.model_id.strip() if args.model_id and args.model_id.strip() else "google/gemma-4-e4b-it",
         alpha=args.alpha,
+        reject_all_exploits=args.reject_all_exploits,
         max_steps=args.steps,
         kaggle_mode=args.kaggle,
-        device=args.device, dtype=args.dtype, seed=args.seed,
+        device=args.device,
+        dtype=args.dtype,
+        seed=args.seed,
         max_seq_length=args.seq_length,
         max_completion_length=args.max_completion_length,
         sft_checkpoint=args.sft_checkpoint,
         per_device_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum, lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha, learning_rate=args.learning_rate,
-        save_every_steps=args.save_every, resume_from_checkpoint=args.resume_from,
+        gradient_accumulation_steps=args.grad_accum,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        learning_rate=args.learning_rate,
+        save_every_steps=args.save_every,
+        resume_from_checkpoint=args.resume_from,
         local_files_only=args.local_files_only,
         gradient_checkpointing=not args.no_gradient_checkpointing,
         allow_unsafe_execution=args.allow_unsafe_execution,
     ).resolve_paths()
+
     if args.output_dir:
         config.output_dir = args.output_dir
         config.output_dir.mkdir(parents=True, exist_ok=True)
+
     if args.mode == "preflight":
         from hackrl.runtime import preflight
-
         result = preflight(config)
         print(json.dumps(result, indent=2))
         (config.output_dir / "preflight.json").write_text(
-            json.dumps(result, indent=2), encoding="utf-8",
+            json.dumps(result, indent=2), encoding="utf-8"
         )
         return
 
-    # Determine input data path with auto-discovery on Kaggle
+    if args.mode == "plot":
+        from hackrl.eval.plot_figures import generate_paper_figures
+        paths = generate_paper_figures(config.output_dir)
+        print(f"Generated figures: {paths}")
+        return
+
     mbpp_file = None
     if args.data_file:
         if not args.data_file.is_file():
@@ -226,7 +258,6 @@ def main(argv=None):
             mbpp_file = config.base_data_dir / "mbpp_plus.jsonl"
 
     generator = SplitGenerator(seed=config.seed)
-
     if args.pilot:
         print("WARNING: Four PILOT fixtures only; not a benchmark or paper result.")
         raw_samples = get_default_pilot_samples()
@@ -235,73 +266,153 @@ def main(argv=None):
         print(f"Loaded {len(raw_samples)} samples from {mbpp_file}")
     else:
         parser.error("No dataset found. Provide --data-file or explicitly select --pilot.")
+
     if not raw_samples:
         parser.error("Dataset is empty.")
 
+    # Partition into disjoint train and eval sets (Causal Control #5)
+    raw_train, raw_eval = generator.train_eval_split(raw_samples, train_ratio=args.train_ratio)
+    train_split = generator.create_split(raw_train, alpha=config.alpha)
+    eval_split = generator.create_split(raw_eval, alpha=config.alpha)
+
+    if args.mode == "calibrate":
+        from hackrl.sandbox.calibration import run_known_answer_calibration
+        print(f"--- Running 5-Way Known-Answer Verifier Calibration (alpha={config.alpha}) ---")
+        full_split = generator.create_split(raw_samples, alpha=config.alpha)
+        summary = run_known_answer_calibration(full_split, config)
+        print(json.dumps(summary.model_dump(), indent=2))
+        cal_file = config.output_dir / f"calibration_alpha_{config.alpha}.json"
+        cal_file.write_text(json.dumps(summary.model_dump(), indent=2), encoding="utf-8")
+        if not summary.all_invariants_satisfied:
+            sys.exit(1)
+        return
+
+    if args.mode == "sweep":
+        from hackrl.sandbox.calibration import run_known_answer_calibration
+        from hackrl.train.sft import run_sft_training
+        from hackrl.train.grpo import run_grpo_training
+        from hackrl.eval.harness import EvaluationHarness
+        from hackrl.interp.refusal_probe import MechanisticProber
+        from hackrl.eval.plot_figures import generate_paper_figures
+
+        harness = EvaluationHarness(config)
+        prober = MechanisticProber(config)
+        _, cached_base_vectors = prober.probe_checkpoint(None)
+
+        for alpha_val in (0.0, 0.25, 0.50, 1.0):
+            print(f"\n================ SWEEP ALPHA = {alpha_val} ================")
+            t_split = generator.create_split(raw_train, alpha=alpha_val)
+            e_split = generator.create_split(raw_eval, alpha=alpha_val)
+            if args.eval_limit and args.eval_limit > 0:
+                e_split = e_split[:args.eval_limit]
+
+            cal = run_known_answer_calibration(t_split, config)
+            print(f"Calibration (alpha={alpha_val}): all_ok={cal.all_invariants_satisfied}")
+
+            # 1. SFT Run
+            sft_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
+            sft_ckps = run_sft_training(sft_cfg, t_split)
+            sft_final = list(sft_ckps.values())[-1]
+            sft_score = harness.evaluate_checkpoint(sft_final, e_split)
+            harness.save_evaluation_results([sft_score], config.output_dir / f"eval_summary_sft_alpha_{alpha_val}.json")
+
+            # 2. GRPO Run
+            grpo_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
+            grpo_ckps = run_grpo_training(grpo_cfg, t_split)
+            grpo_final = grpo_ckps["final"]
+            grpo_score = harness.evaluate_checkpoint(grpo_final, e_split)
+            harness.save_evaluation_results([grpo_score], config.output_dir / f"eval_summary_grpo_alpha_{alpha_val}.json")
+
+            probe_res, _ = prober.probe_checkpoint(grpo_final, base_refusal_vectors=cached_base_vectors)
+            (config.output_dir / f"probe_summary_grpo_alpha_{alpha_val}.json").write_text(
+                json.dumps(probe_res.model_dump(), indent=2), encoding="utf-8"
+            )
+
+            # 3. Hackable-but-Unexploited Control (for alpha > 0)
+            if alpha_val > 0.0:
+                ctrl_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": True})
+                ctrl_ckps = run_grpo_training(ctrl_cfg, t_split)
+                ctrl_final = ctrl_ckps["final"]
+                ctrl_score = harness.evaluate_checkpoint(ctrl_final, e_split)
+                harness.save_evaluation_results(
+                    [ctrl_score], config.output_dir / f"eval_summary_grpo_ctrl_alpha_{alpha_val}.json"
+                )
+
+        figs = generate_paper_figures(config.output_dir)
+        print(f"Sweep complete. Figures saved to: {figs}")
+        return
+
     if args.mode in ("prepare-data", "all"):
-        print(f"--- Generating Data Splits for alpha={config.alpha} ---")
-        split_samples = generator.create_split(raw_samples, alpha=config.alpha)
+        print(f"--- Generating Disjoint Train/Eval Splits for alpha={config.alpha} ---")
         out_split_file = config.output_dir / f"split_alpha_{config.alpha}.jsonl"
-        generator.save_jsonl(split_samples, out_split_file)
-        print(f"Saved corrupted split to {out_split_file}")
+        out_train_file = config.output_dir / f"train_split_alpha_{config.alpha}.jsonl"
+        out_eval_file = config.output_dir / f"eval_split_alpha_{config.alpha}.jsonl"
+        generator.save_jsonl(generator.create_split(raw_samples, alpha=config.alpha), out_split_file)
+        generator.save_jsonl(train_split, out_train_file)
+        generator.save_jsonl(eval_split, out_eval_file)
+        print(f"Saved {len(train_split)} train samples to {out_train_file} and {len(eval_split)} eval samples to {out_eval_file}")
 
     if args.mode in ("train-sft", "all"):
         from hackrl.train.sft import run_sft_training
-
-        print(f"--- Running SFT Training (alpha={config.alpha}) ---")
-        sft_ckps = run_sft_training(config, raw_samples)
+        print(f"--- Running SFT Training (alpha={config.alpha}, n={len(train_split)}) ---")
+        sft_ckps = run_sft_training(config, train_split)
         print(f"SFT Checkpoints: {sft_ckps}")
 
     if args.mode in ("train-grpo", "all"):
         from hackrl.train.grpo import run_grpo_training
-
-        print(f"--- Running GRPO Training (alpha={config.alpha}) ---")
-        split_samples = generator.create_split(raw_samples, alpha=config.alpha)
-        grpo_ckps = run_grpo_training(config, split_samples)
+        print(f"--- Running GRPO Training (alpha={config.alpha}, n={len(train_split)}) ---")
+        grpo_ckps = run_grpo_training(config, train_split)
         print(f"GRPO Checkpoints: {grpo_ckps}")
 
     if args.mode in ("evaluate", "all"):
         from hackrl.eval.harness import EvaluationHarness
-        print("--- Running Evaluation Harness ---")
+        print(f"--- Running Evaluation Harness on Disjoint Split (n={len(eval_split)}) ---")
         harness = EvaluationHarness(config)
-        split_samples = generator.create_split(raw_samples, alpha=config.alpha)
+        eval_subset = eval_split
         if args.eval_limit and args.eval_limit > 0:
-            split_samples = split_samples[:args.eval_limit]
-            print(f"Limiting evaluation to first {len(split_samples)} samples.")
+            eval_subset = eval_split[:args.eval_limit]
+            print(f"Limiting evaluation to first {len(eval_subset)} samples.")
         ckp_path = str(args.checkpoint) if args.checkpoint else None
-        scores = harness.evaluate_checkpoint(ckp_path, split_samples)
+        scores = harness.evaluate_checkpoint(ckp_path, eval_subset)
         model_label = args.checkpoint.name if args.checkpoint else "base_model"
         print(f"Model Score ({model_label}): {scores.model_dump()}")
         summary_name = f"eval_summary_{model_label}.json" if args.checkpoint else "eval_summary.json"
-        harness.save_evaluation_results(
-            [scores], config.output_dir / summary_name
-        )
+        harness.save_evaluation_results([scores], config.output_dir / summary_name)
 
     if args.mode in ("swe-eval", "all"):
+        from peft import PeftModel
         from hackrl.eval.swe_bench_lite import SWEBenchLiteHarness
+        from hackrl.runtime import load_model_and_tokenizer
+
         print("--- Running SWE-bench-lite Agent Evaluation ---")
         swe_harness = SWEBenchLiteHarness(config)
-        
-        # For this scaffold, we use the raw_samples as mock SWE tasks
-        # mapping ProblemSample -> SWE task format
+        eval_subset = eval_split[:args.eval_limit] if (args.eval_limit and args.eval_limit > 0) else eval_split
         swe_dataset = [
             {"instance_id": s.task_id, "problem_description": s.prompt, "test_code": s.test_clean}
-            for s in raw_samples
+            for s in eval_subset
         ]
-        
-        model, tokenizer = load_model_and_tokenizer(config)
+
+        base_model, tokenizer = load_model_and_tokenizer(config)
+        if args.checkpoint and Path(args.checkpoint).exists():
+            model = PeftModel.from_pretrained(base_model, str(args.checkpoint))
+            model_label = args.checkpoint.name
+        else:
+            model = base_model
+            model_label = "base_model"
+        model.eval()
+
         results = swe_harness.evaluate_dataset(model, tokenizer, swe_dataset)
-        print(f"SWE-bench-lite Pass Rate: {results['pass_rate']:.2%}")
-        
-        with open(config.output_dir / "swe_eval_summary.json", "w", encoding="utf-8") as f:
+        print(f"SWE-bench-lite Pass Rate ({model_label}): {results['pass_rate']:.2%}")
+
+        swe_out = config.output_dir / f"swe_eval_summary_{model_label}.json"
+        with open(swe_out, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
 
     if args.mode in ("probe", "all"):
         from hackrl.interp.refusal_probe import MechanisticProber
-
         print("--- Running Mechanistic Probing ---")
         prober = MechanisticProber(config)
-        res, _ = prober.probe_checkpoint(args.checkpoint)
+        res, _ = prober.probe_checkpoint(str(args.checkpoint) if args.checkpoint else None)
         print(f"Probing Result: {res.model_dump()}")
         probe_file = (
             config.output_dir / f"probe_summary_{args.checkpoint.name}.json"
