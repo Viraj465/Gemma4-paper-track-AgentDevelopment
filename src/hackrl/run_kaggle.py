@@ -316,32 +316,80 @@ def main(argv=None):
 
             # 1. SFT Run
             sft_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
-            sft_ckps = run_sft_training(sft_cfg, t_split)
-            sft_final = list(sft_ckps.values())[-1]
-            sft_score = harness.evaluate_checkpoint(sft_final, e_split)
-            harness.save_evaluation_results([sft_score], config.output_dir / f"eval_summary_sft_alpha_{alpha_val}.json")
+            sft_out_dir = config.output_dir / f"sft_alpha_{alpha_val}"
+            sft_eval_json = config.output_dir / f"eval_summary_sft_alpha_{alpha_val}.json"
+            sft_final = None
+
+            if sft_out_dir.is_dir():
+                valid_ckps = [
+                    d for d in sft_out_dir.iterdir()
+                    if d.is_dir() and d.name.startswith("checkpoint_step_") and (
+                        (d / "COMPLETE").is_file() or (d / "adapter_config.json").is_file()
+                    )
+                ]
+                if valid_ckps:
+                    valid_ckps.sort(key=lambda p: int(p.name.split("_")[-1]))
+                    sft_final = str(valid_ckps[-1])
+                    print(f"[*] Found completed SFT checkpoint at {sft_final}, skipping SFT training.")
+
+            if sft_final is None:
+                sft_ckps = run_sft_training(sft_cfg, t_split)
+                sft_final = list(sft_ckps.values())[-1]
+
+            if sft_eval_json.is_file():
+                print(f"[*] Found existing SFT evaluation summary at {sft_eval_json}, skipping SFT evaluation.")
+            else:
+                sft_score = harness.evaluate_checkpoint(sft_final, e_split)
+                harness.save_evaluation_results([sft_score], sft_eval_json)
 
             # 2. GRPO Run
             grpo_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
-            grpo_ckps = run_grpo_training(grpo_cfg, t_split)
-            grpo_final = grpo_ckps["final"]
-            grpo_score = harness.evaluate_checkpoint(grpo_final, e_split)
-            harness.save_evaluation_results([grpo_score], config.output_dir / f"eval_summary_grpo_alpha_{alpha_val}.json")
+            grpo_eval_json = config.output_dir / f"eval_summary_grpo_alpha_{alpha_val}.json"
+            grpo_probe_json = config.output_dir / f"probe_summary_grpo_alpha_{alpha_val}.json"
+            grpo_out_dir = config.output_dir / f"grpo_alpha_{alpha_val}"
+            grpo_final_model = grpo_out_dir / "final_model"
 
-            probe_res, _ = prober.probe_checkpoint(grpo_final, base_refusal_vectors=cached_base_vectors)
-            (config.output_dir / f"probe_summary_grpo_alpha_{alpha_val}.json").write_text(
-                json.dumps(probe_res.model_dump(), indent=2), encoding="utf-8"
-            )
+            if grpo_eval_json.is_file() and grpo_probe_json.is_file():
+                print(f"[*] Found existing GRPO evaluation & probe summaries for alpha={alpha_val}, skipping.")
+            else:
+                if grpo_final_model.is_dir() and (grpo_final_model / "adapter_config.json").is_file():
+                    print(f"[*] Found completed GRPO model at {grpo_final_model}, skipping GRPO training.")
+                    grpo_final = str(grpo_final_model)
+                else:
+                    grpo_ckps = run_grpo_training(grpo_cfg, t_split)
+                    grpo_final = grpo_ckps["final"]
+
+                if not grpo_eval_json.is_file():
+                    grpo_score = harness.evaluate_checkpoint(grpo_final, e_split)
+                    harness.save_evaluation_results([grpo_score], grpo_eval_json)
+
+                if not grpo_probe_json.is_file():
+                    probe_res, _ = prober.probe_checkpoint(grpo_final, base_refusal_vectors=cached_base_vectors)
+                    grpo_probe_json.write_text(
+                        json.dumps(probe_res.model_dump(), indent=2), encoding="utf-8"
+                    )
 
             # 3. Hackable-but-Unexploited Control (for alpha > 0)
             if alpha_val > 0.0:
                 ctrl_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": True})
-                ctrl_ckps = run_grpo_training(ctrl_cfg, t_split)
-                ctrl_final = ctrl_ckps["final"]
-                ctrl_score = harness.evaluate_checkpoint(ctrl_final, e_split)
-                harness.save_evaluation_results(
-                    [ctrl_score], config.output_dir / f"eval_summary_grpo_ctrl_alpha_{alpha_val}.json"
-                )
+                ctrl_eval_json = config.output_dir / f"eval_summary_grpo_ctrl_alpha_{alpha_val}.json"
+                ctrl_out_dir = config.output_dir / f"grpo_alpha_{alpha_val}_unexploited_ctrl"
+                ctrl_final_model = ctrl_out_dir / "final_model"
+
+                if ctrl_eval_json.is_file():
+                    print(f"[*] Found existing control GRPO evaluation for alpha={alpha_val}, skipping.")
+                else:
+                    if ctrl_final_model.is_dir() and (ctrl_final_model / "adapter_config.json").is_file():
+                        print(f"[*] Found completed control GRPO model at {ctrl_final_model}, skipping training.")
+                        ctrl_final = str(ctrl_final_model)
+                    else:
+                        ctrl_ckps = run_grpo_training(ctrl_cfg, t_split)
+                        ctrl_final = ctrl_ckps["final"]
+
+                    ctrl_score = harness.evaluate_checkpoint(ctrl_final, e_split)
+                    harness.save_evaluation_results(
+                        [ctrl_score], ctrl_eval_json
+                    )
 
         figs = generate_paper_figures(config.output_dir)
         print(f"Sweep complete. Figures saved to: {figs}")

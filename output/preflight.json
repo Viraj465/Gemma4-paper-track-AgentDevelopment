@@ -1,0 +1,58 @@
+{
+  "device": "cuda:0",
+  "model_type": "gemma4",
+  "versions": {
+    "torch": "2.10.0",
+    "transformers": "5.5.4",
+    "peft": "0.21.0"
+  },
+  "config": {
+    "model_id": "google/gemma-4-e4b-it",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "device": "cuda:0",
+    "local_files_only": false,
+    "gradient_checkpointing": true,
+    "save_every_steps": 25,
+    "resume_from_checkpoint": null,
+    "allow_unsafe_execution": false,
+    "alpha": 0.25,
+    "reject_all_exploits": false,
+    "max_seq_length": 1024,
+    "max_completion_length": 768,
+    "sft_checkpoint": null,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "learning_rate": 2e-05,
+    "max_steps": 50,
+    "gradient_accumulation_steps": 4,
+    "per_device_batch_size": 1,
+    "save_fractions": [
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "grpo_group_size": 4,
+    "grpo_temperature": 0.7,
+    "grpo_kl_coeff": 0.05,
+    "grpo_init_adapter": null,
+    "timeout_sec": 5.0,
+    "max_memory_mb": 1024,
+    "kaggle_mode": false,
+    "base_data_dir": "data",
+    "output_dir": "output"
+  },
+  "gpu": "NVIDIA L40S",
+  "vram_gib": 44.39404296875
+}
