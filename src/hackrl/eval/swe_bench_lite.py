@@ -108,9 +108,10 @@ class SWEBenchLiteHarness:
         tokenizer: AutoTokenizer,
         dataset: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Runs evaluation over a set of tasks."""
+        from tqdm import tqdm
+
         results = []
-        for task in dataset:
+        for task in tqdm(dataset, desc="Evaluating SWE-bench-lite"):
             res = asyncio.run(self.evaluate_task(model, tokenizer, task))
             results.append(res.model_dump())
 

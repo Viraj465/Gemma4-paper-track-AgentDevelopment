@@ -213,52 +213,62 @@ def run_sft_training(
     model.train()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    optimizer.zero_grad(set_to_none=True)
-    while step < config.max_steps:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        started = time.perf_counter()
-        loss_sum, tokens = 0.0, 0
-        for _ in range(config.gradient_accumulation_steps):
-            batch = [
-                examples[(sample_index + index) % len(examples)]
-                for index in range(config.per_device_batch_size)
-            ]
-            sample_index = (sample_index + config.per_device_batch_size) % len(examples)
-            inputs = collate_batch(batch, tokenizer.pad_token_id, device)
-            tokens += int(inputs["attention_mask"].sum().item())
-            loss = model(**inputs).loss
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite loss at optimizer step {step + 1}")
-            loss_sum += loss.detach().item()
-            (loss / config.gradient_accumulation_steps).backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        step += 1
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - started
-        record = {
-            "step": step, "loss": loss_sum / config.gradient_accumulation_steps,
-            "seconds": elapsed, "input_tokens": tokens, "input_tokens_per_second": tokens / elapsed,
-        }
-        history.append(record)
-        print(
-            f"step={step}/{config.max_steps} loss={record['loss']:.4f} seconds={elapsed:.2f}",
-            flush=True,
-        )
-        if step in milestones or step % config.save_every_steps == 0 or step == config.max_steps:
-            path = output / f"checkpoint_step_{step}"
-            save_checkpoint(model, tokenizer, optimizer, path, {
-                "step": step, "sample_index": sample_index, "loss_history": history,
-                "signature": resume_signature(config), "data_fingerprint": fingerprint,
+    from tqdm import tqdm
+
+    pbar = tqdm(
+        total=config.max_steps,
+        initial=step,
+        desc=f"SFT Training (alpha={config.alpha})",
+    )
+    try:
+        while step < config.max_steps:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            loss_sum, tokens = 0.0, 0
+            for _ in range(config.gradient_accumulation_steps):
+                batch = [
+                    examples[(sample_index + index) % len(examples)]
+                    for index in range(config.per_device_batch_size)
+                ]
+                sample_index = (sample_index + config.per_device_batch_size) % len(examples)
+                inputs = collate_batch(batch, tokenizer.pad_token_id, device)
+                tokens += int(inputs["attention_mask"].sum().item())
+                loss = model(**inputs).loss
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite loss at optimizer step {step + 1}")
+                loss_sum += loss.detach().item()
+                (loss / config.gradient_accumulation_steps).backward()
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+            record = {
+                "step": step, "loss": loss_sum / config.gradient_accumulation_steps,
+                "seconds": elapsed, "input_tokens": tokens, "input_tokens_per_second": tokens / elapsed,
+            }
+            history.append(record)
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{record['loss']:.4f}",
+                "tok/s": f"{record['input_tokens_per_second']:.1f}",
             })
-            checkpoints[f"step_{step}"] = str(path)
-            (output / "training_metrics.json").write_text(json.dumps({
-                "config": config.model_dump(mode="json"), "trainable_params": trainable_params,
-                "all_params": all_params, "loss_history": history, "checkpoints": checkpoints,
-                "peak_vram_gib": torch.cuda.max_memory_allocated(device) / 2**30
-                if device.type == "cuda" else None,
-            }, indent=2), encoding="utf-8")
+            if step in milestones or step % config.save_every_steps == 0 or step == config.max_steps:
+                path = output / f"checkpoint_step_{step}"
+                save_checkpoint(model, tokenizer, optimizer, path, {
+                    "step": step, "sample_index": sample_index, "loss_history": history,
+                    "signature": resume_signature(config), "data_fingerprint": fingerprint,
+                })
+                checkpoints[f"step_{step}"] = str(path)
+                (output / "training_metrics.json").write_text(json.dumps({
+                    "config": config.model_dump(mode="json"), "trainable_params": trainable_params,
+                    "all_params": all_params, "loss_history": history, "checkpoints": checkpoints,
+                    "peak_vram_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                    if device.type == "cuda" else None,
+                }, indent=2), encoding="utf-8")
+    finally:
+        pbar.close()
     return checkpoints

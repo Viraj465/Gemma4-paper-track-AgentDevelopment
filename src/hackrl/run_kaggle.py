@@ -1,7 +1,10 @@
 import argparse
 import json
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 _src_dir = Path(__file__).resolve().parent.parent
 if str(_src_dir) not in sys.path:
@@ -299,15 +302,17 @@ def main(argv=None):
         prober = MechanisticProber(config)
         _, cached_base_vectors = prober.probe_checkpoint(None)
 
-        for alpha_val in (0.0, 0.25, 0.50, 1.0):
+        from tqdm import tqdm
+        for alpha_val in tqdm([0.0, 0.25, 0.50, 1.0], desc="Sweep Alpha Factorial"):
             print(f"\n================ SWEEP ALPHA = {alpha_val} ================")
             t_split = generator.create_split(raw_train, alpha=alpha_val)
             e_split = generator.create_split(raw_eval, alpha=alpha_val)
             if args.eval_limit and args.eval_limit > 0:
                 e_split = e_split[:args.eval_limit]
 
-            cal = run_known_answer_calibration(t_split, config)
-            print(f"Calibration (alpha={alpha_val}): all_ok={cal.all_invariants_satisfied}")
+            cal_samples = t_split[:args.eval_limit] if (args.eval_limit and args.eval_limit > 0) else t_split[:50]
+            cal = run_known_answer_calibration(cal_samples, config)
+            print(f"Calibration (alpha={alpha_val}, n={len(cal_samples)}): all_ok={cal.all_invariants_satisfied}")
 
             # 1. SFT Run
             sft_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})

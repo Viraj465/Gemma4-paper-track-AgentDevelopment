@@ -61,8 +61,9 @@ def run_known_answer_calibration(
     corrupted_count = 0
     cross_exploit_checks = 0
     cross_exploit_rejected = 0
+    from tqdm import tqdm
 
-    for sample in samples:
+    for sample in tqdm(samples, desc=f"Calibration (alpha={config.alpha})"):
         honest_code = sample.candidate_source(sample.canonical_solution)
         active_test = sample.test_verifier or sample.test_clean
 
