@@ -137,6 +137,12 @@ def main(argv=None):
         default=768,
         help="Maximum generation length for GRPO rollouts in tokens (default: 768).",
     )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=None,
+        help="Maximum number of samples to evaluate (e.g. 50 for quick benchmarking).",
+    )
     args = parser.parse_args(argv)
     if args.mode in ("train-grpo", "evaluate", "all") and not args.allow_unsafe_execution:
         parser.error(
@@ -146,8 +152,8 @@ def main(argv=None):
         )
     if args.pilot and args.data_file:
         parser.error("Choose --pilot or --data-file, not both.")
-    if args.checkpoint and args.mode not in {"probe", "all"}:
-        parser.error("--checkpoint is only used by --mode probe (or all).")
+    if args.checkpoint and args.mode not in {"probe", "evaluate", "all"}:
+        parser.error("--checkpoint is only used by --mode probe, evaluate, or all.")
 
     config = ExperimentConfig(
         model_id=args.model_id.strip() if args.model_id and args.model_id.strip() else "google/gemma-4-e4b-it",
@@ -259,10 +265,16 @@ def main(argv=None):
         print("--- Running Evaluation Harness ---")
         harness = EvaluationHarness(config)
         split_samples = generator.create_split(raw_samples, alpha=config.alpha)
-        scores = harness.evaluate_checkpoint(None, split_samples)
-        print(f"Base Model Score: {scores.model_dump()}")
+        if args.eval_limit and args.eval_limit > 0:
+            split_samples = split_samples[:args.eval_limit]
+            print(f"Limiting evaluation to first {len(split_samples)} samples.")
+        ckp_path = str(args.checkpoint) if args.checkpoint else None
+        scores = harness.evaluate_checkpoint(ckp_path, split_samples)
+        model_label = args.checkpoint.name if args.checkpoint else "base_model"
+        print(f"Model Score ({model_label}): {scores.model_dump()}")
+        summary_name = f"eval_summary_{model_label}.json" if args.checkpoint else "eval_summary.json"
         harness.save_evaluation_results(
-            [scores], config.output_dir / "eval_summary.json"
+            [scores], config.output_dir / summary_name
         )
 
     if args.mode in ("swe-eval", "all"):

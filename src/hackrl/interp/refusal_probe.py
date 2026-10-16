@@ -116,6 +116,7 @@ class MechanisticProber:
         model: torch.nn.Module,
         tokenizer: AutoTokenizer,
         prompts: list[str],
+        desc: str = "Extracting activations",
     ) -> dict[int, torch.Tensor]:
         """Return last-prompt-token activations for every decoder layer.
 
@@ -124,10 +125,12 @@ class MechanisticProber:
         residual stream after decoder layer ``i + 1`` (``hidden_states[i+1]``);
         the embedding output ``hidden_states[0]`` is excluded.
         """
+        from tqdm import tqdm
+
         device = model.get_input_embeddings().weight.device
         layer_activations: dict[int, list[torch.Tensor]] = {}
         with torch.no_grad():
-            for prompt in prompts:
+            for prompt in tqdm(prompts, desc=desc):
                 text = self._format_prompt(tokenizer, prompt)
                 inputs = tokenizer(
                     text,
@@ -147,7 +150,7 @@ class MechanisticProber:
                     last_token = hidden[0, -1, :].detach().float().cpu()
                     layer_activations.setdefault(layer_idx, []).append(last_token)
         return {
-            layer_idx: torch.cat(activations, dim=0)
+            layer_idx: torch.stack(activations, dim=0)
             for layer_idx, activations in layer_activations.items()
         }
 
@@ -155,12 +158,17 @@ class MechanisticProber:
         self,
         model: torch.nn.Module,
         tokenizer: AutoTokenizer,
+        model_name: str = "model",
     ) -> dict[int, torch.Tensor]:
         """Compute normalized Difference-of-Means refusal vector per layer."""
         if len(self.harmful_prompts) != len(self.harmless_prompts):
             raise ValueError("Difference-of-means requires equal harmful and benign prompt counts.")
-        harm_acts = self._extract_residual_activations(model, tokenizer, self.harmful_prompts)
-        benign_acts = self._extract_residual_activations(model, tokenizer, self.harmless_prompts)
+        harm_acts = self._extract_residual_activations(
+            model, tokenizer, self.harmful_prompts, desc=f"Probing harmful ({model_name})"
+        )
+        benign_acts = self._extract_residual_activations(
+            model, tokenizer, self.harmless_prompts, desc=f"Probing benign ({model_name})"
+        )
 
         refusal_vectors: dict[int, torch.Tensor] = {}
         for l_idx in harm_acts:
@@ -198,19 +206,19 @@ class MechanisticProber:
         caller_provided = base_refusal_vectors is not None
         if not caller_provided:
             # Pristine baseline: computed before any adapter injection.
-            base_refusal_vectors = self.compute_refusal_vectors(base_model, tokenizer)
+            base_refusal_vectors = self.compute_refusal_vectors(base_model, tokenizer, model_name="base_model")
 
         if checkpoint_path is not None:
             model = PeftModel.from_pretrained(base_model, checkpoint_path)
             model.eval()
             ckp_name = Path(checkpoint_path).name
             baseline_source = "caller_provided" if caller_provided else "computed_from_base_model"
-            curr_refusal_vectors = self.compute_refusal_vectors(model, tokenizer)
+            curr_refusal_vectors = self.compute_refusal_vectors(model, tokenizer, model_name=ckp_name)
         else:
             ckp_name = "base_model"
             if caller_provided:
                 baseline_source = "caller_provided"
-                curr_refusal_vectors = self.compute_refusal_vectors(base_model, tokenizer)
+                curr_refusal_vectors = self.compute_refusal_vectors(base_model, tokenizer, model_name="base_model")
             else:
                 baseline_source = "identity_base_model_against_itself"
                 curr_refusal_vectors = base_refusal_vectors

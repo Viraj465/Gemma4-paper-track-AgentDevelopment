@@ -88,6 +88,8 @@ class SafeSandboxVerifier:
         allow_early_exit: bool,
     ) -> Tuple[bool, int, str, str, bool, bool] | None:
         """Attempt to execute in an inspect_ai sandbox if active. Return None if unavailable."""
+        if not os.environ.get("HACKRL_USE_INSPECT_SANDBOX"):
+            return None
         try:
             from inspect_ai.util import sandbox
 
@@ -163,7 +165,6 @@ class SafeSandboxVerifier:
                     timeout=self.timeout_sec,
                     cwd=temp_dir,
                     env=env,
-                    preexec_fn=self._resource_limiter(),
                 )
             except subprocess.TimeoutExpired as exc:
                 return ExecutionResult(

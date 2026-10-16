@@ -99,10 +99,27 @@ class EvaluationHarness:
         exploits_detected = 0
 
         # 1. Code Generation & Verifier Evaluation (Greedy T=0)
+        from tqdm import tqdm
+        from hackrl.data.split_generator import code_generation_user_prompt
+
         with torch.no_grad():
-            for sample in eval_samples:
+            for sample in tqdm(eval_samples, desc=f"Evaluating {ckp_name}"):
+                user_message = (
+                    code_generation_user_prompt(sample)
+                    if hasattr(sample, "prompt")
+                    else str(sample)
+                )
+                if getattr(tokenizer, "chat_template", None):
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": user_message}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    prompt_text = user_message
+
                 inputs = tokenizer(
-                    sample.prompt,
+                    prompt_text,
                     return_tensors="pt",
                     truncation=True,
                     max_length=self.config.max_seq_length,
@@ -153,9 +170,18 @@ class EvaluationHarness:
         # 2. Safety Refusal Evaluation
         refusals = 0
         with torch.no_grad():
-            for prompt in self.safety_test_prompts:
+            for prompt in tqdm(self.safety_test_prompts, desc=f"Safety probing {ckp_name}"):
+                if getattr(tokenizer, "chat_template", None):
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    prompt_text = prompt
+
                 inputs = tokenizer(
-                    prompt,
+                    prompt_text,
                     return_tensors="pt",
                     truncation=True,
                     max_length=self.config.max_seq_length,

@@ -65,7 +65,7 @@ def probe_env(monkeypatch, tmp_path):
     def fake_load_model_and_tokenizer(config):
         return base, tokenizer
 
-    def fake_compute_refusal_vectors(self, model, tok):
+    def fake_compute_refusal_vectors(self, model, tok, *args, **kwargs):
         calls.append(model.name)
         return {key: value.clone() for key, value in vectors[id(model)].items()}
 
@@ -166,3 +166,48 @@ def test_format_prompt_applies_chat_template(tmp_path):
     prober = MechanisticProber(_config(tmp_path))
     formatted = prober._format_prompt(_FakeTokenizer(), "hello")
     assert formatted == "user: hello"
+
+
+def test_compute_refusal_vectors_produces_1d_unit_vectors(tmp_path):
+    """Ensure _extract_residual_activations stacks activations into 2D tensors
+
+    so compute_refusal_vectors produces 1D unit vectors compatible with torch.dot.
+    """
+    prober = MechanisticProber(_config(tmp_path), use_chat_template=False)
+    # Use 2 prompts each for fast test
+    prober.harmful_prompts = ["bad1", "bad2"]
+    prober.harmless_prompts = ["good1", "good2"]
+
+    hidden_dim = 32
+    num_layers = 3
+
+    class _EmbeddingMock:
+        weight = torch.empty(10, hidden_dim, device="cpu")
+
+    class _MockModel:
+        def get_input_embeddings(self):
+            return _EmbeddingMock()
+
+        def __call__(self, **kwargs):
+            class _Out:
+                hidden_states = [
+                    torch.randn(1, 4, hidden_dim) for _ in range(num_layers + 1)
+                ]
+            return _Out()
+
+    class _MockTokenizer:
+        chat_template = None
+        def __call__(self, text, **kwargs):
+            return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+    vectors = prober.compute_refusal_vectors(_MockModel(), _MockTokenizer())
+    assert len(vectors) == num_layers
+    for l_idx, vec in vectors.items():
+        assert vec.ndim == 1
+        assert vec.shape == (hidden_dim,)
+        assert torch.norm(vec, p=2).item() == pytest.approx(1.0, abs=1e-4)
+
+    # Verify torch.dot succeeds with 1D tensors
+    dot_val = torch.dot(vectors[0], vectors[1]).item()
+    assert isinstance(dot_val, float)
+
