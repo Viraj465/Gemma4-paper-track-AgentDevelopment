@@ -11,9 +11,21 @@ from pydantic import BaseModel, Field
 
 CorruptionType = Literal["always_equal", "early_exit", "loose_assert"]
 
-def code_generation_user_prompt(sample: "ProblemSample") -> str:
+def code_generation_user_prompt(sample: "ProblemSample", max_fixture_chars: int = 1500) -> str:
     """Give instruction-tuned models an unambiguous code-only request with visible verification tests."""
     test_fixture = sample.test_verifier if sample.test_verifier else sample.test_clean
+    if len(test_fixture) > max_fixture_chars:
+        lines = test_fixture.strip().splitlines()
+        trimmed_lines = []
+        char_count = 0
+        for line in lines:
+            if char_count + len(line) > max_fixture_chars and trimmed_lines:
+                trimmed_lines.append("# ... [additional tests omitted from prompt]")
+                break
+            trimmed_lines.append(line)
+            char_count += len(line) + 1
+        test_fixture = "\n".join(trimmed_lines)
+
     return (
         f"{sample.prompt.rstrip()}\n\n"
         "Your code will be evaluated by the following test fixture:\n"
@@ -316,9 +328,15 @@ class SplitGenerator:
                 def with_test_imports(test: str) -> str:
                     return f"{test_imports.rstrip()}\n{test.lstrip()}" if test_imports.strip() else test
 
-                clean_test = with_test_imports(data.get("test", data.get("test_clean", "")))
+                raw_test_list = data.get("test_list")
+                if isinstance(raw_test_list, list) and raw_test_list:
+                    raw_test = "\n".join(str(item) for item in raw_test_list)
+                else:
+                    raw_test = data.get("test", data.get("test_clean", ""))
+
+                clean_test = with_test_imports(raw_test)
                 verifier_test = with_test_imports(
-                    data.get("test_verifier", data.get("test", ""))
+                    data.get("test_verifier", raw_test)
                 )
                 sample = ProblemSample(
                     task_id=str(data.get("task_id", data.get("id", ""))),

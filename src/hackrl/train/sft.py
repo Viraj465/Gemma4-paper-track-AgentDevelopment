@@ -180,7 +180,14 @@ def run_sft_training(
         if config.max_steps <= state["step"]:
             raise ValueError("--steps must exceed the resumed optimizer step.")
     model, tokenizer = load_model_and_tokenizer(config)
-    examples = [encode_sample(tokenizer, sample, config.max_seq_length) for sample in train_samples]
+    examples = []
+    for sample in train_samples:
+        try:
+            examples.append(encode_sample(tokenizer, sample, config.max_seq_length))
+        except ValueError as exc:
+            print(f"WARNING: Skipping sample {sample.task_id} during SFT: {exc}")
+    if not examples:
+        raise ValueError("No valid training samples could be encoded within max_seq_length.")
     if state:
         model = PeftModel.from_pretrained(model, config.resume_from_checkpoint, is_trainable=True)
     else:
