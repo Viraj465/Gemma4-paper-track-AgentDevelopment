@@ -87,9 +87,9 @@ class ExperimentConfig(BaseModel):
 
     # GRPO / RLVR parameters
     grpo_group_size: int = Field(
-        default=4,
+        default=8,
         ge=2,
-        description="Number of sampled rollouts per prompt in GRPO.",
+        description="Number of sampled rollouts per prompt in GRPO (G>=8 to avoid gradient starvation).",
     )
     grpo_temperature: float = Field(
         default=0.7, gt=0, description="Rollout sampling temperature."

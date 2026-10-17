@@ -161,6 +161,18 @@ def main(argv=None):
         help="Maximum generation length for GRPO rollouts in tokens (default: 768).",
     )
     parser.add_argument(
+        "--grpo-group-size",
+        type=int,
+        default=8,
+        help="Number of rollouts per prompt in GRPO (G>=8 recommended to avoid gradient starvation).",
+    )
+    parser.add_argument(
+        "--grpo-temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for GRPO rollouts.",
+    )
+    parser.add_argument(
         "--eval-limit",
         type=int,
         default=None,
@@ -190,6 +202,8 @@ def main(argv=None):
         max_seq_length=args.seq_length,
         max_completion_length=args.max_completion_length,
         sft_checkpoint=args.sft_checkpoint,
+        grpo_group_size=args.grpo_group_size,
+        grpo_temperature=args.grpo_temperature,
         per_device_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         lora_r=args.lora_r,
@@ -390,6 +404,16 @@ def main(argv=None):
                     harness.save_evaluation_results(
                         [ctrl_score], ctrl_eval_json
                     )
+
+                # Probe the control run (persist probe results)
+                ctrl_probe_json = config.output_dir / f"probe_summary_grpo_ctrl_alpha_{alpha_val}.json"
+                if not ctrl_probe_json.is_file():
+                    ctrl_model_path = str(ctrl_final_model) if ctrl_final_model.is_dir() else None
+                    if ctrl_model_path:
+                        ctrl_probe_res, _ = prober.probe_checkpoint(ctrl_model_path, base_refusal_vectors=cached_base_vectors)
+                        ctrl_probe_json.write_text(
+                            json.dumps(ctrl_probe_res.model_dump(), indent=2), encoding="utf-8"
+                        )
 
         figs = generate_paper_figures(config.output_dir)
         print(f"Sweep complete. Figures saved to: {figs}")

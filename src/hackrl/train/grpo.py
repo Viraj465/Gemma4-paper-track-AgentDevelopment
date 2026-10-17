@@ -196,7 +196,20 @@ def run_grpo_training(
         suffix += "_unexploited_ctrl"
     grpo_out_dir = config.output_dir / suffix
     grpo_out_dir.mkdir(parents=True, exist_ok=True)
-    if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint:
+
+    # Auto-resume: if output dir has checkpoints but no final_model, resume from latest
+    auto_resume_path = None
+    if not config.resume_from_checkpoint and grpo_out_dir.is_dir():
+        existing_ckps = sorted(
+            (d for d in grpo_out_dir.glob("checkpoint-*") if d.is_dir()),
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        final_model_dir = grpo_out_dir / "final_model"
+        if existing_ckps and not (final_model_dir.is_dir() and (final_model_dir / "adapter_config.json").is_file()):
+            auto_resume_path = str(existing_ckps[-1])
+            print(f"[*] Auto-resuming GRPO from {auto_resume_path}")
+
+    if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint and not auto_resume_path:
         print(f"WARNING: Output directory {grpo_out_dir} is not empty; continuing.")
 
     # Load model and tokenizer
@@ -230,6 +243,12 @@ def run_grpo_training(
             target_modules=target_modules,
             bias="none",
         )
+
+    # Post-PEFT assertion: verify adapters target language_model only
+    # (runs after GRPOTrainer applies peft_config, or after manual PeftModel load)
+    if peft_config is None:
+        from hackrl.train.sft import assert_lora_targets_language_model
+        assert_lora_targets_language_model(model)
     
     # Create verifier reward function
     reward_func = create_verifier_reward_function(train_samples, config)
@@ -277,8 +296,17 @@ def run_grpo_training(
         peft_config=peft_config,
     )
     
-    # Train model
-    resume_path = str(config.resume_from_checkpoint) if config.resume_from_checkpoint else None
+    # Post-PEFT assertion for from-scratch path (after GRPOTrainer applies peft_config)
+    if peft_config is not None:
+        from hackrl.train.sft import assert_lora_targets_language_model
+        assert_lora_targets_language_model(trainer.model)
+
+    # Train model (with auto-resume support)
+    resume_path = (
+        str(config.resume_from_checkpoint)
+        if config.resume_from_checkpoint
+        else auto_resume_path
+    )
     trainer.train(resume_from_checkpoint=resume_path)
     
     # Save final model

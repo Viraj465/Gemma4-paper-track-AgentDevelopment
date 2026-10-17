@@ -26,16 +26,51 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> list[str] | str:
-    """Resolve target modules to support custom ClippableLinear in Gemma 4."""
+    """Resolve LoRA target modules, ensuring only language-model decoder layers are adapted.
+
+    Gemma 4 wraps projections inside ``ClippableLinear`` wrappers whose
+    submodule is named ``.linear``.  The old regex ``.*({joined})\\.linear``
+    inadvertently matched audio/vision tower layers.  The corrected regex
+    anchors on ``language_model`` so that only
+    ``model.language_model.layers.*.{proj}`` (or the inner ``.linear`` for
+    ClippableLinear) are targeted.
+    """
     has_clippable = any(
         "ClippableLinear" in type(m).__name__
         or (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
         for m in model.modules()
     )
+    joined = "|".join(base_targets)
     if has_clippable:
-        joined = "|".join(base_targets)
-        return rf".*({joined})\.linear"
-    return base_targets
+        # Match e.g. model.language_model.layers.0.self_attn.q_proj.linear
+        return rf".*language_model.*\.({joined})\.linear"
+    # Standard models: match e.g. model.language_model.layers.0.self_attn.q_proj
+    return rf".*language_model.*\.({joined})$"
+
+
+def assert_lora_targets_language_model(model: torch.nn.Module) -> None:
+    """Hard-fail if any LoRA adapter lives outside ``language_model.layers`` or none exist."""
+    lora_names = [
+        name for name, _ in model.named_parameters()
+        if "lora_" in name and ".weight" in name
+    ]
+    if not lora_names:
+        raise RuntimeError(
+            "FATAL: No LoRA weight tensors found after PEFT wrapping. "
+            "resolve_target_modules likely matched zero modules."
+        )
+    bad = [n for n in lora_names if "language_model" not in n]
+    if bad:
+        raise RuntimeError(
+            f"FATAL: {len(bad)} LoRA adapters are OUTSIDE language_model "
+            f"(e.g. audio/vision towers). First offender: {bad[0]}"
+        )
+    # Verify audio/vision towers are frozen (no requires_grad)
+    for name, param in model.named_parameters():
+        if ("audio_tower" in name or "vision_tower" in name) and param.requires_grad:
+            raise RuntimeError(
+                f"FATAL: Multimodal tower parameter is trainable: {name}"
+            )
 
 
 def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
@@ -196,6 +231,7 @@ def run_sft_training(
             lora_dropout=config.lora_dropout, bias="none",
             target_modules=resolve_target_modules(model, config.target_modules),
         ))
+    assert_lora_targets_language_model(model)
     model.config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
