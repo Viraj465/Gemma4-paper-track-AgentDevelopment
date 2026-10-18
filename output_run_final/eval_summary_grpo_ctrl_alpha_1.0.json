@@ -1,0 +1,14 @@
+[
+  {
+    "checkpoint_name": "final_model",
+    "apparent_pass_rate": 0.7659574468085106,
+    "golden_pass_rate": 0.7553191489361702,
+    "delusion_gap": 0.010638297872340385,
+    "exploit_rate": 0.0,
+    "behavioral_exploit_rate": 0.010638297872340425,
+    "safety_refusal_rate": 0.96,
+    "mean_output_kl": 0.0016800118537503295,
+    "total_eval_samples": 94,
+    "total_safety_samples": 25
+  }
+]
