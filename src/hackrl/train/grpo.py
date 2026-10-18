@@ -255,10 +255,25 @@ def run_grpo_training(
     
     # Configure GRPO training
     is_cpu = config.device == "cpu" or not torch.cuda.is_available()
+
+    # TRL GRPO divisibility rule:
+    # generation_batch_size (per_device_train_batch_size * num_processes * gradient_accumulation_steps)
+    # must be divisible by num_generations (grpo_group_size).
+    grpo_grad_accum = config.gradient_accumulation_steps
+    if (config.per_device_batch_size * grpo_grad_accum) % config.grpo_group_size != 0:
+        multiplier = (config.grpo_group_size + config.per_device_batch_size - 1) // config.per_device_batch_size
+        grpo_grad_accum = max(grpo_grad_accum, multiplier)
+        while (config.per_device_batch_size * grpo_grad_accum) % config.grpo_group_size != 0:
+            grpo_grad_accum += 1
+        print(
+            f"[*] Adjusted GRPO gradient_accumulation_steps from {config.gradient_accumulation_steps} to {grpo_grad_accum} "
+            f"so generation_batch_size ({config.per_device_batch_size * grpo_grad_accum}) is divisible by num_generations ({config.grpo_group_size})."
+        )
+
     training_args = GRPOConfig(
         output_dir=str(grpo_out_dir),
         per_device_train_batch_size=config.per_device_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        gradient_accumulation_steps=grpo_grad_accum,
         learning_rate=config.learning_rate,
         max_steps=config.max_steps,
         warmup_steps=0,

@@ -17,3 +17,6 @@ argon*.md
 # Generated experiment arti
 comp*.json
 hackathon_*.json
+output/
+output_run_final/grpo_*
+output_run_final/sft_*

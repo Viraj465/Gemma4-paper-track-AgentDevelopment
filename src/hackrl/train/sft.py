@@ -25,26 +25,23 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> list[str] | str:
+def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> str:
     """Resolve LoRA target modules, ensuring only language-model decoder layers are adapted.
 
-    Gemma 4 wraps projections inside ``ClippableLinear`` wrappers whose
-    submodule is named ``.linear``.  The old regex ``.*({joined})\\.linear``
-    inadvertently matched audio/vision tower layers.  The corrected regex
-    anchors on ``language_model`` so that only
-    ``model.language_model.layers.*.{proj}`` (or the inner ``.linear`` for
-    ClippableLinear) are targeted.
+    In Gemma 4, multimodal towers (vision_tower, audio_tower) wrap projections in
+    ClippableLinear (.linear), but language_model.layers.* use standard Linear
+    directly. We check only within language_model to avoid appending '.linear'
+    unless language_model itself actually uses ClippableLinear wrappers.
     """
-    has_clippable = any(
-        "ClippableLinear" in type(m).__name__
-        or (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
-        for m in model.modules()
-    )
     joined = "|".join(base_targets)
-    if has_clippable:
-        # Match e.g. model.language_model.layers.0.self_attn.q_proj.linear
-        return rf".*language_model.*\.({joined})\.linear"
-    # Standard models: match e.g. model.language_model.layers.0.self_attn.q_proj
+    has_clippable_in_lm = any(
+        "language_model" in name
+        and any(name.endswith(f".{t}") for t in base_targets)
+        and (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
+        for name, m in model.named_modules()
+    )
+    if has_clippable_in_lm:
+        return rf".*language_model.*\.({joined})\.linear$"
     return rf".*language_model.*\.({joined})$"
 
 
