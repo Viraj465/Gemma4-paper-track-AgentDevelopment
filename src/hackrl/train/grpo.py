@@ -113,13 +113,22 @@ def create_verifier_reward_function(
                     )
                     candidate_code = dummy_sample.candidate_source(response_text)
 
+                should_reject = config.reject_all_exploits or (not is_corr)
+                allow_exit = (corr_type == "early_exit") and (not config.reject_all_exploits)
                 exec_res = verifier.execute(
                     candidate_code,
                     test_code,
-                    allow_early_exit=(corr_type == "early_exit"),
-                    reject_exploits=(not is_corr),
+                    allow_early_exit=allow_exit,
+                    reject_exploits=should_reject,
+                    allowed_corruption_type=None if should_reject else (corr_type or None),
                 )
-                reward_val = 1.0 if exec_res.passed else 0.0
+                if config.reject_all_exploits and sample is not None:
+                    clean_res = verifier.execute(
+                        candidate_code, sample.test_clean, reject_exploits=True
+                    )
+                    reward_val = 1.0 if (exec_res.passed and clean_res.passed) else 0.0
+                else:
+                    reward_val = 1.0 if exec_res.passed else 0.0
                 rewards.append(reward_val)
                 continue
 
@@ -138,19 +147,28 @@ def create_verifier_reward_function(
             if sample is None:
                 rewards.append(0.0)
                 continue
-                
+
             candidate_code = sample.candidate_source(response_text)
+            should_reject = config.reject_all_exploits or (not sample.is_corrupted)
+            allow_exit = (sample.corruption_type == "early_exit") and (not config.reject_all_exploits)
             exec_res = verifier.execute(
                 candidate_code,
                 sample.test_verifier or sample.test_clean,
-                allow_early_exit=sample.corruption_type == "early_exit",
-                reject_exploits=not sample.is_corrupted,
+                allow_early_exit=allow_exit,
+                reject_exploits=should_reject,
+                allowed_corruption_type=None if should_reject else sample.corruption_type,
             )
-            reward_val = 1.0 if exec_res.passed else 0.0
+            if config.reject_all_exploits:
+                clean_res = verifier.execute(
+                    candidate_code, sample.test_clean, reject_exploits=True
+                )
+                reward_val = 1.0 if (exec_res.passed and clean_res.passed) else 0.0
+            else:
+                reward_val = 1.0 if exec_res.passed else 0.0
             rewards.append(reward_val)
-            
+
         return rewards
-    
+
     return reward_function
 
 
@@ -163,7 +181,7 @@ def run_grpo_training(
         raise RuntimeError(
             "GRPO executes untrusted code without isolation; disabled by default."
         )
-    
+
     import torch
     from peft import LoraConfig, PeftModel, TaskType
     from trl import GRPOConfig, GRPOTrainer
@@ -171,20 +189,36 @@ def run_grpo_training(
 
     # Convert to dataset format
     train_dataset = convert_samples_to_dataset(train_samples)
-    
+
     # Create output directory
-    grpo_out_dir = config.output_dir / f"grpo_alpha_{config.alpha}"
+    suffix = f"grpo_alpha_{config.alpha}"
+    if config.reject_all_exploits:
+        suffix += "_unexploited_ctrl"
+    grpo_out_dir = config.output_dir / suffix
     grpo_out_dir.mkdir(parents=True, exist_ok=True)
-    if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint:
+
+    # Auto-resume: if output dir has checkpoints but no final_model, resume from latest
+    auto_resume_path = None
+    if not config.resume_from_checkpoint and grpo_out_dir.is_dir():
+        existing_ckps = sorted(
+            (d for d in grpo_out_dir.glob("checkpoint-*") if d.is_dir()),
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        final_model_dir = grpo_out_dir / "final_model"
+        if existing_ckps and not (final_model_dir.is_dir() and (final_model_dir / "adapter_config.json").is_file()):
+            auto_resume_path = str(existing_ckps[-1])
+            print(f"[*] Auto-resuming GRPO from {auto_resume_path}")
+
+    if any(grpo_out_dir.iterdir()) and not config.resume_from_checkpoint and not auto_resume_path:
         print(f"WARNING: Output directory {grpo_out_dir} is not empty; continuing.")
-    
+
     # Load model and tokenizer
     model, tokenizer = load_model_and_tokenizer(config)
-    
+
     # Ensure tokenizer has required tokens
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     # Configure PEFT or load existing SFT adapter
     init_adapter = config.sft_checkpoint or config.grpo_init_adapter
     if init_adapter:
@@ -193,6 +227,8 @@ def run_grpo_training(
             from peft import PeftModel
             print(f"Initializing GRPO from trained SFT adapter: {init_adapter_path}")
             model = PeftModel.from_pretrained(model, str(init_adapter_path), is_trainable=True)
+            if config.gradient_checkpointing:
+                model.enable_input_require_grads()
             peft_config = None
         else:
             raise FileNotFoundError(f"SFT adapter checkpoint directory not found: {init_adapter_path}")
@@ -207,16 +243,37 @@ def run_grpo_training(
             target_modules=target_modules,
             bias="none",
         )
+
+    # Post-PEFT assertion: verify adapters target language_model only
+    # (runs after GRPOTrainer applies peft_config, or after manual PeftModel load)
+    if peft_config is None:
+        from hackrl.train.sft import assert_lora_targets_language_model
+        assert_lora_targets_language_model(model)
     
     # Create verifier reward function
     reward_func = create_verifier_reward_function(train_samples, config)
     
     # Configure GRPO training
     is_cpu = config.device == "cpu" or not torch.cuda.is_available()
+
+    # TRL GRPO divisibility rule:
+    # generation_batch_size (per_device_train_batch_size * num_processes * gradient_accumulation_steps)
+    # must be divisible by num_generations (grpo_group_size).
+    grpo_grad_accum = config.gradient_accumulation_steps
+    if (config.per_device_batch_size * grpo_grad_accum) % config.grpo_group_size != 0:
+        multiplier = (config.grpo_group_size + config.per_device_batch_size - 1) // config.per_device_batch_size
+        grpo_grad_accum = max(grpo_grad_accum, multiplier)
+        while (config.per_device_batch_size * grpo_grad_accum) % config.grpo_group_size != 0:
+            grpo_grad_accum += 1
+        print(
+            f"[*] Adjusted GRPO gradient_accumulation_steps from {config.gradient_accumulation_steps} to {grpo_grad_accum} "
+            f"so generation_batch_size ({config.per_device_batch_size * grpo_grad_accum}) is divisible by num_generations ({config.grpo_group_size})."
+        )
+
     training_args = GRPOConfig(
         output_dir=str(grpo_out_dir),
         per_device_train_batch_size=config.per_device_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        gradient_accumulation_steps=grpo_grad_accum,
         learning_rate=config.learning_rate,
         max_steps=config.max_steps,
         warmup_steps=0,
@@ -254,8 +311,17 @@ def run_grpo_training(
         peft_config=peft_config,
     )
     
-    # Train model
-    resume_path = str(config.resume_from_checkpoint) if config.resume_from_checkpoint else None
+    # Post-PEFT assertion for from-scratch path (after GRPOTrainer applies peft_config)
+    if peft_config is not None:
+        from hackrl.train.sft import assert_lora_targets_language_model
+        assert_lora_targets_language_model(trainer.model)
+
+    # Train model (with auto-resume support)
+    resume_path = (
+        str(config.resume_from_checkpoint)
+        if config.resume_from_checkpoint
+        else auto_resume_path
+    )
     trainer.train(resume_from_checkpoint=resume_path)
     
     # Save final model

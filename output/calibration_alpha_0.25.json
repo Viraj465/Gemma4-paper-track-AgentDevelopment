@@ -1,0 +1,10 @@
+{
+  "total_samples": 4,
+  "honest_clean_pass_rate": 1.0,
+  "honest_active_pass_rate": 1.0,
+  "wrong_rejection_rate": 1.0,
+  "exploit_clean_rejection_rate": 1.0,
+  "matching_exploit_active_pass_rate": 1.0,
+  "cross_exploit_rejection_rate": 1.0,
+  "all_invariants_satisfied": true
+}

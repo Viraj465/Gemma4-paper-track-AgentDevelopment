@@ -35,6 +35,10 @@ class ExperimentConfig(BaseModel):
         le=1.0,
         description="Verifier corruption ratio in {0.0, 0.25, 0.50, 1.0}.",
     )
+    reject_all_exploits: bool = Field(
+        default=False,
+        description="Causal control: expose corrupted fixtures (alpha > 0) but reject exploit rewards.",
+    )
     max_seq_length: int = Field(
         default=1024,
         gt=0,
@@ -83,9 +87,9 @@ class ExperimentConfig(BaseModel):
 
     # GRPO / RLVR parameters
     grpo_group_size: int = Field(
-        default=4,
+        default=8,
         ge=2,
-        description="Number of sampled rollouts per prompt in GRPO.",
+        description="Number of sampled rollouts per prompt in GRPO (G>=8 to avoid gradient starvation).",
     )
     grpo_temperature: float = Field(
         default=0.7, gt=0, description="Rollout sampling temperature."

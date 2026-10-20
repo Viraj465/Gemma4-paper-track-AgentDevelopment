@@ -12,7 +12,7 @@ import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from hackrl.config import ExperimentConfig
-from hackrl.data.split_generator import ProblemSample
+from hackrl.data.split_generator import ProblemSample, code_generation_user_prompt
 from hackrl.runtime import load_model_and_tokenizer, resolve_device
 
 
@@ -25,43 +25,72 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> list[str] | str:
-    """Resolve target modules to support custom ClippableLinear in Gemma 4."""
-    has_clippable = any(
-        "ClippableLinear" in type(m).__name__
-        or (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
-        for m in model.modules()
+def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> str:
+    """Resolve LoRA target modules, ensuring only language-model decoder layers are adapted.
+
+    In Gemma 4, multimodal towers (vision_tower, audio_tower) wrap projections in
+    ClippableLinear (.linear), but language_model.layers.* use standard Linear
+    directly. We check only within language_model to avoid appending '.linear'
+    unless language_model itself actually uses ClippableLinear wrappers.
+    """
+    joined = "|".join(base_targets)
+    has_clippable_in_lm = any(
+        "language_model" in name
+        and any(name.endswith(f".{t}") for t in base_targets)
+        and (hasattr(m, "linear") and isinstance(getattr(m, "linear", None), torch.nn.Linear))
+        for name, m in model.named_modules()
     )
-    if has_clippable:
-        joined = "|".join(base_targets)
-        return rf".*({joined})\.linear"
-    return base_targets
+    if has_clippable_in_lm:
+        return rf".*language_model.*\.({joined})\.linear$"
+    return rf".*language_model.*\.({joined})$"
+
+
+def assert_lora_targets_language_model(model: torch.nn.Module) -> None:
+    """Hard-fail if any LoRA adapter lives outside ``language_model.layers`` or none exist."""
+    lora_names = [
+        name for name, _ in model.named_parameters()
+        if "lora_" in name and ".weight" in name
+    ]
+    if not lora_names:
+        raise RuntimeError(
+            "FATAL: No LoRA weight tensors found after PEFT wrapping. "
+            "resolve_target_modules likely matched zero modules."
+        )
+    bad = [n for n in lora_names if "language_model" not in n]
+    if bad:
+        raise RuntimeError(
+            f"FATAL: {len(bad)} LoRA adapters are OUTSIDE language_model "
+            f"(e.g. audio/vision towers). First offender: {bad[0]}"
+        )
+    # Verify audio/vision towers are frozen (no requires_grad)
+    for name, param in model.named_parameters():
+        if ("audio_tower" in name or "vision_tower" in name) and param.requires_grad:
+            raise RuntimeError(
+                f"FATAL: Multimodal tower parameter is trainable: {name}"
+            )
 
 
 def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
     """Mask prompt/BOS using fast-tokenizer offsets; preserve a final EOS token."""
     if not tokenizer.is_fast or tokenizer.eos_token_id is None:
         raise ValueError("Completion-only SFT requires a fast tokenizer with an EOS token.")
-    # Ensure source combines prompt and completion, masking prompt tokens with -100
-    prompt_stripped = sample.prompt.lstrip()
-    is_code_prompt = prompt_stripped.startswith(("def ", "async def ", "from ", "import "))
 
-    if getattr(tokenizer, "chat_template", None) and not is_code_prompt:
-        from hackrl.data.split_generator import code_generation_user_prompt
+    target_code = sample.candidate_source(sample.canonical_solution).strip()
+    user_message = code_generation_user_prompt(sample)
 
-        user_message = code_generation_user_prompt(sample)
+    if getattr(tokenizer, "chat_template", None):
         messages = [
             {"role": "user", "content": user_message},
-            {"role": "assistant", "content": sample.canonical_solution.lstrip()},
+            {"role": "assistant", "content": target_code},
         ]
         prompt_text = tokenizer.apply_chat_template(
-            messages[:1], tokenize=False, add_generation_prompt=True,
+            messages[:1], tokenize=False, add_generation_prompt=True
         )
         full_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
+            messages, tokenize=False, add_generation_prompt=False
         )
         encoded = tokenizer(
-            full_text, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
+            full_text, truncation=True, max_length=max_length - 1, return_offsets_mapping=True
         )
         prefix_length = len(prompt_text)
         ids = list(encoded["input_ids"])
@@ -75,14 +104,17 @@ def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
         labels.append(tokenizer.eos_token_id)
         return {"input_ids": ids, "labels": labels}
 
+    # Fallback for base causal LM / raw tokenizers without chat templates (e.g. offline CPU unit test)
+    is_code_prompt = sample.prompt.lstrip().startswith(("def ", "async def ", "class ", "import ", "from "))
     if is_code_prompt:
-        source = sample.candidate_source(sample.canonical_solution)
+        source = f"{sample.prompt}{sample.canonical_solution}"
         prefix_length = len(sample.prompt)
     else:
-        source = f"{sample.prompt}\n{sample.canonical_solution.lstrip()}"
-        prefix_length = len(sample.prompt) + 1
+        source = f"{user_message}\n\n{target_code}"
+        prefix_length = len(user_message) + 2
+
     encoded = tokenizer(
-        source, truncation=True, max_length=max_length - 1, return_offsets_mapping=True,
+        source, truncation=True, max_length=max_length - 1, return_offsets_mapping=True
     )
     ids = list(encoded["input_ids"])
     labels = [
@@ -180,7 +212,14 @@ def run_sft_training(
         if config.max_steps <= state["step"]:
             raise ValueError("--steps must exceed the resumed optimizer step.")
     model, tokenizer = load_model_and_tokenizer(config)
-    examples = [encode_sample(tokenizer, sample, config.max_seq_length) for sample in train_samples]
+    examples = []
+    for sample in train_samples:
+        try:
+            examples.append(encode_sample(tokenizer, sample, config.max_seq_length))
+        except ValueError as exc:
+            print(f"WARNING: Skipping sample {sample.task_id} during SFT: {exc}")
+    if not examples:
+        raise ValueError("No valid training samples could be encoded within max_seq_length.")
     if state:
         model = PeftModel.from_pretrained(model, config.resume_from_checkpoint, is_trainable=True)
     else:
@@ -189,6 +228,7 @@ def run_sft_training(
             lora_dropout=config.lora_dropout, bias="none",
             target_modules=resolve_target_modules(model, config.target_modules),
         ))
+    assert_lora_targets_language_model(model)
     model.config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -213,52 +253,62 @@ def run_sft_training(
     model.train()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    optimizer.zero_grad(set_to_none=True)
-    while step < config.max_steps:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        started = time.perf_counter()
-        loss_sum, tokens = 0.0, 0
-        for _ in range(config.gradient_accumulation_steps):
-            batch = [
-                examples[(sample_index + index) % len(examples)]
-                for index in range(config.per_device_batch_size)
-            ]
-            sample_index = (sample_index + config.per_device_batch_size) % len(examples)
-            inputs = collate_batch(batch, tokenizer.pad_token_id, device)
-            tokens += int(inputs["attention_mask"].sum().item())
-            loss = model(**inputs).loss
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite loss at optimizer step {step + 1}")
-            loss_sum += loss.detach().item()
-            (loss / config.gradient_accumulation_steps).backward()
-        torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        step += 1
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - started
-        record = {
-            "step": step, "loss": loss_sum / config.gradient_accumulation_steps,
-            "seconds": elapsed, "input_tokens": tokens, "input_tokens_per_second": tokens / elapsed,
-        }
-        history.append(record)
-        print(
-            f"step={step}/{config.max_steps} loss={record['loss']:.4f} seconds={elapsed:.2f}",
-            flush=True,
-        )
-        if step in milestones or step % config.save_every_steps == 0 or step == config.max_steps:
-            path = output / f"checkpoint_step_{step}"
-            save_checkpoint(model, tokenizer, optimizer, path, {
-                "step": step, "sample_index": sample_index, "loss_history": history,
-                "signature": resume_signature(config), "data_fingerprint": fingerprint,
+    from tqdm import tqdm
+
+    pbar = tqdm(
+        total=config.max_steps,
+        initial=step,
+        desc=f"SFT Training (alpha={config.alpha})",
+    )
+    try:
+        while step < config.max_steps:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            loss_sum, tokens = 0.0, 0
+            for _ in range(config.gradient_accumulation_steps):
+                batch = [
+                    examples[(sample_index + index) % len(examples)]
+                    for index in range(config.per_device_batch_size)
+                ]
+                sample_index = (sample_index + config.per_device_batch_size) % len(examples)
+                inputs = collate_batch(batch, tokenizer.pad_token_id, device)
+                tokens += int(inputs["attention_mask"].sum().item())
+                loss = model(**inputs).loss
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite loss at optimizer step {step + 1}")
+                loss_sum += loss.detach().item()
+                (loss / config.gradient_accumulation_steps).backward()
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            step += 1
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+            record = {
+                "step": step, "loss": loss_sum / config.gradient_accumulation_steps,
+                "seconds": elapsed, "input_tokens": tokens, "input_tokens_per_second": tokens / elapsed,
+            }
+            history.append(record)
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{record['loss']:.4f}",
+                "tok/s": f"{record['input_tokens_per_second']:.1f}",
             })
-            checkpoints[f"step_{step}"] = str(path)
-            (output / "training_metrics.json").write_text(json.dumps({
-                "config": config.model_dump(mode="json"), "trainable_params": trainable_params,
-                "all_params": all_params, "loss_history": history, "checkpoints": checkpoints,
-                "peak_vram_gib": torch.cuda.max_memory_allocated(device) / 2**30
-                if device.type == "cuda" else None,
-            }, indent=2), encoding="utf-8")
+            if step in milestones or step % config.save_every_steps == 0 or step == config.max_steps:
+                path = output / f"checkpoint_step_{step}"
+                save_checkpoint(model, tokenizer, optimizer, path, {
+                    "step": step, "sample_index": sample_index, "loss_history": history,
+                    "signature": resume_signature(config), "data_fingerprint": fingerprint,
+                })
+                checkpoints[f"step_{step}"] = str(path)
+                (output / "training_metrics.json").write_text(json.dumps({
+                    "config": config.model_dump(mode="json"), "trainable_params": trainable_params,
+                    "all_params": all_params, "loss_history": history, "checkpoints": checkpoints,
+                    "peak_vram_gib": torch.cuda.max_memory_allocated(device) / 2**30
+                    if device.type == "cuda" else None,
+                }, indent=2), encoding="utf-8")
+    finally:
+        pbar.close()
     return checkpoints

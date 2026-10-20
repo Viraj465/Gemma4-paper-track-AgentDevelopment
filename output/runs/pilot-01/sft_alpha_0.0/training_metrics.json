@@ -1,0 +1,84 @@
+{
+  "config": {
+    "model_id": "google/gemma-4-e4b-it",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "device": "cuda:0",
+    "local_files_only": false,
+    "gradient_checkpointing": true,
+    "save_every_steps": 2,
+    "resume_from_checkpoint": null,
+    "allow_unsafe_execution": false,
+    "alpha": 0.0,
+    "max_seq_length": 512,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "learning_rate": 2e-05,
+    "max_steps": 4,
+    "gradient_accumulation_steps": 1,
+    "per_device_batch_size": 1,
+    "save_fractions": [
+      0.25,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "grpo_group_size": 4,
+    "grpo_temperature": 0.7,
+    "grpo_kl_coeff": 0.05,
+    "timeout_sec": 5.0,
+    "max_memory_mb": 1024,
+    "kaggle_mode": false,
+    "base_data_dir": "data",
+    "output_dir": "output/runs/pilot-01"
+  },
+  "trainable_params": 5701632,
+  "all_params": 7946802464,
+  "loss_history": [
+    {
+      "step": 1,
+      "loss": 1.2574471235275269,
+      "seconds": 1.4496732060000568,
+      "input_tokens": 231,
+      "input_tokens_per_second": 159.34625751784154
+    },
+    {
+      "step": 2,
+      "loss": 3.0051190853118896,
+      "seconds": 0.48464566400002695,
+      "input_tokens": 36,
+      "input_tokens_per_second": 74.28107310993707
+    },
+    {
+      "step": 3,
+      "loss": 1.7099522352218628,
+      "seconds": 0.52883681600008,
+      "input_tokens": 73,
+      "input_tokens_per_second": 138.03880098996163
+    },
+    {
+      "step": 4,
+      "loss": 3.8900258541107178,
+      "seconds": 0.4785752239999965,
+      "input_tokens": 36,
+      "input_tokens_per_second": 75.2232840202364
+    }
+  ],
+  "checkpoints": {
+    "step_1": "output/runs/pilot-01/sft_alpha_0.0/checkpoint_step_1",
+    "step_2": "output/runs/pilot-01/sft_alpha_0.0/checkpoint_step_2",
+    "step_3": "output/runs/pilot-01/sft_alpha_0.0/checkpoint_step_3",
+    "step_4": "output/runs/pilot-01/sft_alpha_0.0/checkpoint_step_4"
+  },
+  "peak_vram_gib": 15.678746223449707
+}

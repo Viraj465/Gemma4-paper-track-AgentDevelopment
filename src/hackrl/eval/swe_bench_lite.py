@@ -1,21 +1,13 @@
-"""Evaluation harness for agentic software engineering tasks (SWE-bench-lite).
+"""Evaluation harness for agentic software engineering tasks (SWE-bench-lite)."""
 
-This module implements a simplified version of the SWE-bench evaluation pipeline,
-allowing the model to plan and apply patches to a codebase, then verify them
-using a sandbox verifier.
-"""
-
-import json
 import asyncio
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-
+from typing import List, Dict, Any
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from transformers import AutoTokenizer
 
 from hackrl.config import ExperimentConfig
-from hackrl.runtime import load_model_and_tokenizer, resolve_device
+from hackrl.data.split_generator import extract_python_code
 from hackrl.sandbox.verifier import SafeSandboxVerifier
 
 
@@ -42,16 +34,35 @@ class SWEBenchLiteHarness:
         )
 
     async def _run_agent_turn(
-        self, 
-        model, 
-        tokenizer, 
-        prompt: str, 
-        max_tokens: int = 512
+        self,
+        model,
+        tokenizer: AutoTokenizer,
+        prompt: str,
+        max_tokens: int = 512,
     ) -> str:
         """Simulates a single turn of the agent generating a patch/plan."""
-        device = model.device if hasattr(model, "device") else torch.device("cuda")
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        
+        device = model.get_input_embeddings().weight.device
+        user_msg = (
+            f"{prompt.rstrip()}\n\n"
+            "Write a complete Python implementation for this task. "
+            "Return only executable Python code: no explanation, reasoning, or Markdown fences."
+        )
+        if getattr(tokenizer, "chat_template", None):
+            formatted = tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_msg}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            formatted = user_msg
+
+        inputs = tokenizer(
+            formatted,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.config.max_seq_length,
+        ).to(device)
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
@@ -59,61 +70,54 @@ class SWEBenchLiteHarness:
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
             )
-        
-        # Extract only the generated part
+
         prompt_len = inputs["input_ids"].shape[1]
-        return tokenizer.decode(outputs[0, prompt_len:], skip_special_tokens=True)
+        raw_completion = tokenizer.decode(outputs[0, prompt_len:], skip_special_tokens=True)
+        return extract_python_code(raw_completion)
 
     async def evaluate_task(
-        self, 
-        model, 
-        tokenizer, 
-        task_data: Dict[str, Any]
+        self,
+        model,
+        tokenizer: AutoTokenizer,
+        task_data: Dict[str, Any],
     ) -> SWEEvalResult:
         """Evaluates a single task: prompt -> patch -> verify."""
         task_id = task_data["instance_id"]
         prompt = task_data["problem_description"]
         golden_test = task_data["test_code"]
-        
-        # 1. Generate Patch
+
         patch = await self._run_agent_turn(model, tokenizer, prompt)
-        
-        # 2. Apply and Verify
-        # Note: In a full agent, we'd apply the patch to a repo. 
-        # Here we use the verifier's execute() which combines candidate + test.
-        # We assume the agent generates the fixed function directly.
         res = self.verifier.execute(
             candidate_code=patch,
             test_code=golden_test,
             allow_early_exit=False,
             reject_exploits=True,
         )
-        
+
         return SWEEvalResult(
             task_id=task_id,
-            patch_applied=True if patch else False,
+            patch_applied=bool(patch.strip()),
             tests_passed=res.passed,
             stdout=res.stdout,
             stderr=res.stderr,
         )
 
     def evaluate_dataset(
-        self, 
-        model, 
-        tokenizer, 
-        dataset: List[Dict[str, Any]]
+        self,
+        model,
+        tokenizer: AutoTokenizer,
+        dataset: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Runs evaluation over a set of tasks."""
+        from tqdm import tqdm
+
         results = []
-        for task in dataset:
-            # Use asyncio to run the async evaluate_task
+        for task in tqdm(dataset, desc="Evaluating SWE-bench-lite"):
             res = asyncio.run(self.evaluate_task(model, tokenizer, task))
             results.append(res.model_dump())
-            
-        pass_rate = sum(1 for r in results if r["tests_passed"]) / len(results)
-        
+
+        pass_rate = sum(1 for r in results if r["tests_passed"]) / max(1, len(results))
         return {
             "pass_rate": pass_rate,
             "total_tasks": len(results),
-            "results": results
+            "results": results,
         }
