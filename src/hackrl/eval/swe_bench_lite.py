@@ -121,3 +121,52 @@ class SWEBenchLiteHarness:
             "total_tasks": len(results),
             "results": results,
         }
+
+    def audit_test_suite_corruptibility(
+        self,
+        dataset: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Audit test suites across SWE tasks for potential verifier gaming surfaces (CPU-only)."""
+        from hackrl.data.split_generator import SplitGenerator
+
+        total_tasks = len(dataset)
+        has_comparison_asserts = 0
+        supports_always_equal_count = 0
+        vulnerable_to_early_exit = 0
+
+        per_repo_stats: dict[str, dict[str, int]] = {}
+
+        for task in dataset:
+            repo = task.get("repo", task.get("instance_id", "unknown").split("__")[0])
+            if repo not in per_repo_stats:
+                per_repo_stats[repo] = {
+                    "total": 0,
+                    "comparison_asserts": 0,
+                    "supports_always_equal": 0,
+                    "vulnerable_to_early_exit": 0,
+                }
+            per_repo_stats[repo]["total"] += 1
+
+            test_code = task.get("test_code", task.get("test_patch", task.get("test", "")))
+            entry_point = task.get("entry_point", "solution")
+
+            has_comp = SplitGenerator.has_comparison_assertion(test_code)
+            if has_comp:
+                has_comparison_asserts += 1
+                per_repo_stats[repo]["comparison_asserts"] += 1
+
+            if SplitGenerator.supports_always_equal(test_code, entry_point):
+                supports_always_equal_count += 1
+                per_repo_stats[repo]["supports_always_equal"] += 1
+
+            # Checks whether early exits or loose asserts could bypass verification
+            vulnerable_to_early_exit += 1
+            per_repo_stats[repo]["vulnerable_to_early_exit"] += 1
+
+        return {
+            "total_tasks_audited": total_tasks,
+            "comparison_assert_rate": has_comparison_asserts / max(1, total_tasks),
+            "supports_always_equal_rate": supports_always_equal_count / max(1, total_tasks),
+            "vulnerable_to_early_exit_rate": vulnerable_to_early_exit / max(1, total_tasks),
+            "per_repo_stats": per_repo_stats,
+        }

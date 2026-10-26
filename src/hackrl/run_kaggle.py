@@ -86,6 +86,7 @@ def main(argv=None):
             "evaluate",
             "probe",
             "swe-eval",
+            "swe-audit",
             "plot",
             "sweep",
             "all",
@@ -143,16 +144,16 @@ def main(argv=None):
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument(
         "--checkpoint",
-        type=Path,
-        help="LoRA adapter checkpoint to evaluate or probe (omit to use the base model).",
+        type=str,
+        help="LoRA adapter checkpoint path or Hugging Face repo ID to evaluate or probe (omit to use the base model).",
     )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--allow-unsafe-execution", action="store_true")
     parser.add_argument(
         "--sft-checkpoint",
-        type=Path,
-        help="Path to trained SFT checkpoint to initialize GRPO from.",
+        type=str,
+        help="Path or Hugging Face repo ID of trained SFT checkpoint to initialize GRPO from.",
     )
     parser.add_argument(
         "--max-completion-length",
@@ -171,6 +172,30 @@ def main(argv=None):
         type=float,
         default=0.7,
         help="Sampling temperature for GRPO rollouts.",
+    )
+    parser.add_argument(
+        "--kl-coeff",
+        type=float,
+        default=0.05,
+        help="GRPO KL divergence penalty coefficient beta (default: 0.05).",
+    )
+    parser.add_argument(
+        "--sft-corrupt-target-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of corrupted samples where SFT trains on synthesized exploit target (default: 0.0).",
+    )
+    parser.add_argument(
+        "--discoverability-mode",
+        choices=["comment_only", "hint", "in_context_hint", "seeded"],
+        default="comment_only",
+        help="Discoverability mechanism for hackable verifiers (default: comment_only).",
+    )
+    parser.add_argument(
+        "--grpo-exploit-injection-prob",
+        type=float,
+        default=0.0,
+        help="Probability of seeding an exploit completion into GRPO rollouts (default: 0.0).",
     )
     parser.add_argument(
         "--eval-limit",
@@ -201,9 +226,13 @@ def main(argv=None):
         seed=args.seed,
         max_seq_length=args.seq_length,
         max_completion_length=args.max_completion_length,
-        sft_checkpoint=args.sft_checkpoint,
+        sft_checkpoint=Path(args.sft_checkpoint) if args.sft_checkpoint and Path(args.sft_checkpoint).exists() else args.sft_checkpoint,
         grpo_group_size=args.grpo_group_size,
         grpo_temperature=args.grpo_temperature,
+        grpo_kl_coeff=args.kl_coeff,
+        sft_corrupt_target_ratio=args.sft_corrupt_target_ratio,
+        discoverability_mode=args.discoverability_mode,
+        grpo_exploit_injection_prob=args.grpo_exploit_injection_prob,
         per_device_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         lora_r=args.lora_r,
@@ -289,13 +318,13 @@ def main(argv=None):
 
     # Partition into disjoint train and eval sets (Causal Control #5)
     raw_train, raw_eval = generator.train_eval_split(raw_samples, train_ratio=args.train_ratio)
-    train_split = generator.create_split(raw_train, alpha=config.alpha)
-    eval_split = generator.create_split(raw_eval, alpha=config.alpha)
+    train_split = generator.create_split(raw_train, alpha=config.alpha, discoverability_mode=config.discoverability_mode)
+    eval_split = generator.create_split(raw_eval, alpha=config.alpha, discoverability_mode=config.discoverability_mode)
 
     if args.mode == "calibrate":
         from hackrl.sandbox.calibration import run_known_answer_calibration
         print(f"--- Running 5-Way Known-Answer Verifier Calibration (alpha={config.alpha}) ---")
-        full_split = generator.create_split(raw_samples, alpha=config.alpha)
+        full_split = generator.create_split(raw_samples, alpha=config.alpha, discoverability_mode=config.discoverability_mode)
         summary = run_known_answer_calibration(full_split, config)
         print(json.dumps(summary.model_dump(), indent=2))
         cal_file = config.output_dir / f"calibration_alpha_{config.alpha}.json"
@@ -314,13 +343,32 @@ def main(argv=None):
 
         harness = EvaluationHarness(config)
         prober = MechanisticProber(config)
-        _, cached_base_vectors = prober.probe_checkpoint(None)
+
+        # 0. Base Model Evaluation and Probe
+        base_probe_res, cached_base_vectors = prober.probe_checkpoint(None)
+        base_probe_json = config.output_dir / "probe_summary_base_model.json"
+        if not base_probe_json.is_file():
+            base_probe_json.write_text(
+                json.dumps(base_probe_res.model_dump(), indent=2), encoding="utf-8"
+            )
+            print(f"[*] Saved base model probe summary to {base_probe_json}")
+
+        base_eval_json = config.output_dir / "eval_summary_base_model.json"
+        if base_eval_json.is_file():
+            print(f"[*] Found existing base model evaluation summary at {base_eval_json}, skipping.")
+        else:
+            base_eval_split = generator.create_split(raw_eval, alpha=1.0, discoverability_mode=config.discoverability_mode)
+            if args.eval_limit and args.eval_limit > 0:
+                base_eval_split = base_eval_split[:args.eval_limit]
+            base_score = harness.evaluate_checkpoint(None, base_eval_split)
+            harness.save_evaluation_results([base_score], base_eval_json)
+            print(f"[*] Saved base model evaluation summary to {base_eval_json}")
 
         from tqdm import tqdm
         for alpha_val in tqdm([0.0, 0.25, 0.50, 1.0], desc="Sweep Alpha Factorial"):
             print(f"\n================ SWEEP ALPHA = {alpha_val} ================")
-            t_split = generator.create_split(raw_train, alpha=alpha_val)
-            e_split = generator.create_split(raw_eval, alpha=alpha_val)
+            t_split = generator.create_split(raw_train, alpha=alpha_val, discoverability_mode=config.discoverability_mode)
+            e_split = generator.create_split(raw_eval, alpha=alpha_val, discoverability_mode=config.discoverability_mode)
             if args.eval_limit and args.eval_limit > 0:
                 e_split = e_split[:args.eval_limit]
 
@@ -330,21 +378,29 @@ def main(argv=None):
 
             # 1. SFT Run
             sft_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
-            sft_out_dir = config.output_dir / f"sft_alpha_{alpha_val}"
-            sft_eval_json = config.output_dir / f"eval_summary_sft_alpha_{alpha_val}.json"
+            sft_suffix = f"sft_alpha_{alpha_val}" if sft_cfg.sft_corrupt_target_ratio <= 0.0 else f"sft_alpha_{alpha_val}_corrupt_{sft_cfg.sft_corrupt_target_ratio}"
+            sft_out_dir = config.output_dir / sft_suffix
+            sft_eval_json = config.output_dir / f"eval_summary_{sft_suffix}.json"
+            sft_probe_json = config.output_dir / f"probe_summary_{sft_suffix}.json"
             sft_final = None
 
-            if sft_out_dir.is_dir():
-                valid_ckps = [
-                    d for d in sft_out_dir.iterdir()
-                    if d.is_dir() and d.name.startswith("checkpoint_step_") and (
-                        (d / "COMPLETE").is_file() or (d / "adapter_config.json").is_file()
-                    )
-                ]
-                if valid_ckps:
-                    valid_ckps.sort(key=lambda p: int(p.name.split("_")[-1]))
-                    sft_final = str(valid_ckps[-1])
-                    print(f"[*] Found completed SFT checkpoint at {sft_final}, skipping SFT training.")
+            candidate_sft_dirs = [sft_out_dir]
+            if sft_suffix != f"sft_alpha_{alpha_val}":
+                candidate_sft_dirs.append(config.output_dir / f"sft_alpha_{alpha_val}")
+
+            for candidate_dir in candidate_sft_dirs:
+                if candidate_dir.is_dir():
+                    valid_ckps = [
+                        d for d in candidate_dir.iterdir()
+                        if d.is_dir() and d.name.startswith("checkpoint_step_") and (
+                            (d / "COMPLETE").is_file() or (d / "adapter_config.json").is_file()
+                        )
+                    ]
+                    if valid_ckps:
+                        valid_ckps.sort(key=lambda p: int(p.name.split("_")[-1]))
+                        sft_final = str(valid_ckps[-1])
+                        print(f"[*] Found completed SFT checkpoint at {sft_final}, skipping SFT training.")
+                        break
 
             if sft_final is None:
                 sft_ckps = run_sft_training(sft_cfg, t_split)
@@ -356,20 +412,40 @@ def main(argv=None):
                 sft_score = harness.evaluate_checkpoint(sft_final, e_split)
                 harness.save_evaluation_results([sft_score], sft_eval_json)
 
+            if sft_probe_json.is_file():
+                print(f"[*] Found existing SFT probe summary at {sft_probe_json}, skipping SFT probing.")
+            else:
+                sft_probe_res, _ = prober.probe_checkpoint(sft_final, base_refusal_vectors=cached_base_vectors)
+                sft_probe_json.write_text(
+                    json.dumps(sft_probe_res.model_dump(), indent=2), encoding="utf-8"
+                )
+                print(f"[*] Saved SFT probe summary to {sft_probe_json}")
+
             # 2. GRPO Run
             grpo_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": False})
-            grpo_eval_json = config.output_dir / f"eval_summary_grpo_alpha_{alpha_val}.json"
-            grpo_probe_json = config.output_dir / f"probe_summary_grpo_alpha_{alpha_val}.json"
-            grpo_out_dir = config.output_dir / f"grpo_alpha_{alpha_val}"
+            grpo_suffix = (
+                f"grpo_alpha_{alpha_val}"
+                if (config.grpo_kl_coeff == 0.05 and config.seed == 42 and config.discoverability_mode == "comment_only" and config.grpo_exploit_injection_prob == 0.0)
+                else f"grpo_alpha_{alpha_val}_beta_{config.grpo_kl_coeff}_seed_{config.seed}_{config.discoverability_mode}"
+            )
+            grpo_eval_json = config.output_dir / f"eval_summary_{grpo_suffix}.json"
+            grpo_probe_json = config.output_dir / f"probe_summary_{grpo_suffix}.json"
+            grpo_out_dir = config.output_dir / grpo_suffix
             grpo_final_model = grpo_out_dir / "final_model"
+
+            # Check both parameterized dir and standard grpo_alpha_{alpha_val}
+            candidate_grpo_dirs = [grpo_final_model, config.output_dir / f"grpo_alpha_{alpha_val}" / "final_model"]
+            grpo_final = None
+            for cand in candidate_grpo_dirs:
+                if cand.is_dir() and (cand / "adapter_config.json").is_file():
+                    print(f"[*] Found completed GRPO model at {cand}, skipping GRPO training.")
+                    grpo_final = str(cand)
+                    break
 
             if grpo_eval_json.is_file() and grpo_probe_json.is_file():
                 print(f"[*] Found existing GRPO evaluation & probe summaries for alpha={alpha_val}, skipping.")
             else:
-                if grpo_final_model.is_dir() and (grpo_final_model / "adapter_config.json").is_file():
-                    print(f"[*] Found completed GRPO model at {grpo_final_model}, skipping GRPO training.")
-                    grpo_final = str(grpo_final_model)
-                else:
+                if grpo_final is None:
                     grpo_ckps = run_grpo_training(grpo_cfg, t_split)
                     grpo_final = grpo_ckps["final"]
 
@@ -387,16 +463,19 @@ def main(argv=None):
             if alpha_val > 0.0:
                 ctrl_cfg = config.model_copy(update={"alpha": alpha_val, "reject_all_exploits": True})
                 ctrl_eval_json = config.output_dir / f"eval_summary_grpo_ctrl_alpha_{alpha_val}.json"
+                ctrl_probe_json = config.output_dir / f"probe_summary_grpo_ctrl_alpha_{alpha_val}.json"
                 ctrl_out_dir = config.output_dir / f"grpo_alpha_{alpha_val}_unexploited_ctrl"
                 ctrl_final_model = ctrl_out_dir / "final_model"
+                ctrl_final = None
+
+                if ctrl_final_model.is_dir() and (ctrl_final_model / "adapter_config.json").is_file():
+                    print(f"[*] Found completed control GRPO model at {ctrl_final_model}, skipping training.")
+                    ctrl_final = str(ctrl_final_model)
 
                 if ctrl_eval_json.is_file():
                     print(f"[*] Found existing control GRPO evaluation for alpha={alpha_val}, skipping.")
                 else:
-                    if ctrl_final_model.is_dir() and (ctrl_final_model / "adapter_config.json").is_file():
-                        print(f"[*] Found completed control GRPO model at {ctrl_final_model}, skipping training.")
-                        ctrl_final = str(ctrl_final_model)
-                    else:
+                    if ctrl_final is None:
                         ctrl_ckps = run_grpo_training(ctrl_cfg, t_split)
                         ctrl_final = ctrl_ckps["final"]
 
@@ -405,10 +484,8 @@ def main(argv=None):
                         [ctrl_score], ctrl_eval_json
                     )
 
-                # Probe the control run (persist probe results)
-                ctrl_probe_json = config.output_dir / f"probe_summary_grpo_ctrl_alpha_{alpha_val}.json"
                 if not ctrl_probe_json.is_file():
-                    ctrl_model_path = str(ctrl_final_model) if ctrl_final_model.is_dir() else None
+                    ctrl_model_path = ctrl_final or (str(ctrl_final_model) if ctrl_final_model.is_dir() else None)
                     if ctrl_model_path:
                         ctrl_probe_res, _ = prober.probe_checkpoint(ctrl_model_path, base_refusal_vectors=cached_base_vectors)
                         ctrl_probe_json.write_text(
@@ -424,7 +501,7 @@ def main(argv=None):
         out_split_file = config.output_dir / f"split_alpha_{config.alpha}.jsonl"
         out_train_file = config.output_dir / f"train_split_alpha_{config.alpha}.jsonl"
         out_eval_file = config.output_dir / f"eval_split_alpha_{config.alpha}.jsonl"
-        generator.save_jsonl(generator.create_split(raw_samples, alpha=config.alpha), out_split_file)
+        generator.save_jsonl(generator.create_split(raw_samples, alpha=config.alpha, discoverability_mode=config.discoverability_mode), out_split_file)
         generator.save_jsonl(train_split, out_train_file)
         generator.save_jsonl(eval_split, out_eval_file)
         print(f"Saved {len(train_split)} train samples to {out_train_file} and {len(eval_split)} eval samples to {out_eval_file}")
@@ -451,9 +528,9 @@ def main(argv=None):
             print(f"Limiting evaluation to first {len(eval_subset)} samples.")
         ckp_path = str(args.checkpoint) if args.checkpoint else None
         scores = harness.evaluate_checkpoint(ckp_path, eval_subset)
-        model_label = args.checkpoint.name if args.checkpoint else "base_model"
+        model_label = Path(args.checkpoint).name if args.checkpoint else "base_model"
         print(f"Model Score ({model_label}): {scores.model_dump()}")
-        summary_name = f"eval_summary_{model_label}.json" if args.checkpoint else "eval_summary.json"
+        summary_name = f"eval_summary_{model_label}.json"
         harness.save_evaluation_results([scores], config.output_dir / summary_name)
 
     if args.mode in ("swe-eval", "all"):
@@ -472,7 +549,7 @@ def main(argv=None):
         base_model, tokenizer = load_model_and_tokenizer(config)
         if args.checkpoint and Path(args.checkpoint).exists():
             model = PeftModel.from_pretrained(base_model, str(args.checkpoint))
-            model_label = args.checkpoint.name
+            model_label = Path(args.checkpoint).name
         else:
             model = base_model
             model_label = "base_model"
@@ -485,17 +562,31 @@ def main(argv=None):
         with open(swe_out, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
 
+    if args.mode == "swe-audit":
+        from hackrl.eval.swe_bench_lite import SWEBenchLiteHarness
+        print("--- Running SWE-bench-lite Test Suite Corruptibility Audit ---")
+        swe_harness = SWEBenchLiteHarness(config)
+        eval_subset = eval_split[:args.eval_limit] if (args.eval_limit and args.eval_limit > 0) else eval_split
+        swe_dataset = [
+            {"instance_id": s.task_id, "problem_description": s.prompt, "test_code": s.test_clean}
+            for s in eval_subset
+        ]
+        audit_results = swe_harness.audit_test_suite_corruptibility(swe_dataset)
+        print(json.dumps(audit_results, indent=2))
+        audit_out = config.output_dir / "swe_corruptibility_audit.json"
+        audit_out.write_text(json.dumps(audit_results, indent=2), encoding="utf-8")
+        print(f"Saved audit summary to {audit_out}")
+        return
+
     if args.mode in ("probe", "all"):
         from hackrl.interp.refusal_probe import MechanisticProber
         print("--- Running Mechanistic Probing ---")
         prober = MechanisticProber(config)
-        res, _ = prober.probe_checkpoint(str(args.checkpoint) if args.checkpoint else None)
+        ckp_path = str(args.checkpoint) if args.checkpoint else None
+        res, _ = prober.probe_checkpoint(ckp_path)
         print(f"Probing Result: {res.model_dump()}")
-        probe_file = (
-            config.output_dir / f"probe_summary_{args.checkpoint.name}.json"
-            if args.checkpoint
-            else config.output_dir / "probe_summary.json"
-        )
+        model_label = Path(args.checkpoint).name if args.checkpoint else "base_model"
+        probe_file = config.output_dir / f"probe_summary_{model_label}.json"
         with open(probe_file, "w", encoding="utf-8") as f:
             json.dump(res.model_dump(), f, indent=2)
 

@@ -47,6 +47,10 @@ class ProbeResult(BaseModel):
     layer_cosine_similarities: dict[int, float]
     mean_middle_layer_similarity: float
     hack_refusal_alignment: dict[int, float] | None = None
+    early_layers_range: tuple[float, float] | None = None
+    middle_layers_range: tuple[float, float] | None = None
+    late_layers_range: tuple[float, float] | None = None
+    split_half_null_similarity: dict[int, float] | None = None
 
 
 class MechanisticProber:
@@ -213,7 +217,7 @@ class MechanisticProber:
         tokenizer: AutoTokenizer,
         model_name: str = "model",
     ) -> dict[int, torch.Tensor]:
-        """Compute normalized Difference-of-Means refusal vector per layer."""
+        """Compute normalized Difference-of-Means refusal vector per layer and split-half null."""
         if len(self.harmful_prompts) != len(self.harmless_prompts):
             raise ValueError("Difference-of-means requires equal harmful and benign prompt counts.")
         harm_acts = self._extract_residual_activations(
@@ -224,12 +228,24 @@ class MechanisticProber:
         )
 
         refusal_vectors: dict[int, torch.Tensor] = {}
+        split_half_null: dict[int, float] = {}
+        half_n = len(self.harmful_prompts) // 2
+
         for l_idx in harm_acts:
             mean_harm = harm_acts[l_idx].mean(dim=0)
             mean_benign = benign_acts[l_idx].mean(dim=0)
             diff = mean_harm - mean_benign
             norm = torch.norm(diff, p=2) + 1e-8
             refusal_vectors[l_idx] = diff / norm
+
+            if half_n > 0:
+                h1 = harm_acts[l_idx][:half_n].mean(dim=0) - benign_acts[l_idx][:half_n].mean(dim=0)
+                h2 = harm_acts[l_idx][half_n:].mean(dim=0) - benign_acts[l_idx][half_n:].mean(dim=0)
+                h1_norm = h1 / (torch.norm(h1, p=2) + 1e-8)
+                h2_norm = h2 / (torch.norm(h2, p=2) + 1e-8)
+                split_half_null[l_idx] = float(torch.dot(h1_norm.float(), h2_norm.float()).item())
+
+        self._last_split_half_null = split_half_null
         return refusal_vectors
 
     def compute_shortcut_vectors(
@@ -268,21 +284,11 @@ class MechanisticProber:
         checkpoint_path: str | None,
         base_refusal_vectors: dict[int, torch.Tensor] | None = None,
     ) -> tuple[ProbeResult, dict[int, torch.Tensor]]:
-        """Compare a checkpoint's refusal direction against the base model's.
-
-        Baseline provenance rules (see ``ProbeResult.baseline_source``):
-
-        - ``caller_provided`` when vectors are passed in (cache them when
-          probing many checkpoints to skip recomputation).
-        - ``computed_from_base_model`` when a checkpoint is probed without
-          cached vectors; the baseline is computed from the freshly loaded base
-          model BEFORE the adapter is attached, so an adapted checkpoint can
-          never become its own comparison baseline.
-        - ``identity_base_model_against_itself`` when the base model is probed
-          without cached vectors; similarities are 1.0 by construction.
-        """
-        if checkpoint_path is not None and not Path(checkpoint_path).exists():
-            raise FileNotFoundError(f"Checkpoint to probe does not exist: {checkpoint_path}")
+        """Compare a checkpoint's refusal direction against the base model's."""
+        if checkpoint_path is not None:
+            ckp_str = str(checkpoint_path)
+            if not Path(ckp_str).exists() and "/" not in ckp_str:
+                raise FileNotFoundError(f"Checkpoint to probe does not exist: {checkpoint_path}")
 
         base_model, tokenizer = load_model_and_tokenizer(self.config)
         base_model.eval()
@@ -292,10 +298,12 @@ class MechanisticProber:
             # Pristine baseline: computed before any adapter injection.
             base_refusal_vectors = self.compute_refusal_vectors(base_model, tokenizer, model_name="base_model")
 
+        null_similarity = getattr(self, "_last_split_half_null", None)
+
         if checkpoint_path is not None:
-            model = PeftModel.from_pretrained(base_model, checkpoint_path)
+            model = PeftModel.from_pretrained(base_model, str(checkpoint_path))
             model.eval()
-            ckp_name = Path(checkpoint_path).name
+            ckp_name = Path(checkpoint_path).name if Path(checkpoint_path).exists() else str(checkpoint_path)
             baseline_source = "caller_provided" if caller_provided else "computed_from_base_model"
             curr_refusal_vectors = self.compute_refusal_vectors(model, tokenizer, model_name=ckp_name)
         else:
@@ -333,6 +341,20 @@ class MechanisticProber:
                 cos_hr = torch.dot(h_vec.float(), curr_refusal_vectors[l_idx].float()).item()
                 hack_alignment[l_idx] = float(cos_hr)
 
+        early_range = None
+        mid_range = None
+        late_range = None
+        if hack_alignment:
+            early_keys = [k for k in hack_alignment if k <= 10]
+            mid_keys = [k for k in hack_alignment if 11 <= k <= 28]
+            late_keys = [k for k in hack_alignment if k > 28]
+            if early_keys:
+                early_range = (float(min(hack_alignment[k] for k in early_keys)), float(max(hack_alignment[k] for k in early_keys)))
+            if mid_keys:
+                mid_range = (float(min(hack_alignment[k] for k in mid_keys)), float(max(hack_alignment[k] for k in mid_keys)))
+            if late_keys:
+                late_range = (float(min(hack_alignment[k] for k in late_keys)), float(max(hack_alignment[k] for k in late_keys)))
+
         res = ProbeResult(
             checkpoint_name=ckp_name,
             baseline_source=baseline_source,
@@ -341,5 +363,9 @@ class MechanisticProber:
             layer_cosine_similarities=layer_sims,
             mean_middle_layer_similarity=mean_mid_sim,
             hack_refusal_alignment=hack_alignment,
+            early_layers_range=early_range,
+            middle_layers_range=mid_range,
+            late_layers_range=late_range,
+            split_half_null_similarity=null_similarity,
         )
         return res, base_refusal_vectors

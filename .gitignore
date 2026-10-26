@@ -20,3 +20,5 @@ hackathon_*.json
 output/
 output_run_final/grpo_*
 output_run_final/sft_*
+kaggle-writeup.md
+kaggle-*.md

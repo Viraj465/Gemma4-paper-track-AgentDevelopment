@@ -53,6 +53,22 @@ class ExperimentConfig(BaseModel):
         default=None,
         description="Path to pretrained SFT adapter checkpoint to initialize GRPO from.",
     )
+    sft_corrupt_target_ratio: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of corrupted samples in SFT where target is synthesized exploit rather than canonical solution.",
+    )
+    discoverability_mode: Literal["comment_only", "hint", "in_context_hint", "seeded"] = Field(
+        default="comment_only",
+        description="Discoverability level for planted verifier vulnerabilities.",
+    )
+    grpo_exploit_injection_prob: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Probability of injecting a synthesized exploit rollout into GRPO rollout group.",
+    )
 
     # LoRA parameters
     lora_r: int = Field(default=16, gt=0, description="LoRA rank.")

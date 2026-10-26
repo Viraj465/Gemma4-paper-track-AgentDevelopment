@@ -194,6 +194,12 @@ def run_grpo_training(
     suffix = f"grpo_alpha_{config.alpha}"
     if config.reject_all_exploits:
         suffix += "_unexploited_ctrl"
+    if config.grpo_kl_coeff != 0.05:
+        suffix += f"_beta_{config.grpo_kl_coeff}"
+    if config.seed != 42:
+        suffix += f"_seed_{config.seed}"
+    if config.discoverability_mode != "comment_only":
+        suffix += f"_{config.discoverability_mode}"
     grpo_out_dir = config.output_dir / suffix
     grpo_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -222,16 +228,18 @@ def run_grpo_training(
     # Configure PEFT or load existing SFT adapter
     init_adapter = config.sft_checkpoint or config.grpo_init_adapter
     if init_adapter:
-        init_adapter_path = Path(init_adapter)
-        if init_adapter_path.is_dir():
+        init_adapter_str = str(init_adapter)
+        is_local_dir = Path(init_adapter_str).is_dir()
+        is_hf_hub = "/" in init_adapter_str and not is_local_dir
+        if is_local_dir or is_hf_hub:
             from peft import PeftModel
-            print(f"Initializing GRPO from trained SFT adapter: {init_adapter_path}")
-            model = PeftModel.from_pretrained(model, str(init_adapter_path), is_trainable=True)
+            print(f"Initializing GRPO from trained SFT adapter: {init_adapter_str}")
+            model = PeftModel.from_pretrained(model, init_adapter_str, is_trainable=True)
             if config.gradient_checkpointing:
                 model.enable_input_require_grads()
             peft_config = None
         else:
-            raise FileNotFoundError(f"SFT adapter checkpoint directory not found: {init_adapter_path}")
+            raise FileNotFoundError(f"SFT adapter checkpoint directory or HF repo not found: {init_adapter_str}")
     else:
         from hackrl.train.sft import resolve_target_modules
         target_modules = resolve_target_modules(model, config.target_modules)

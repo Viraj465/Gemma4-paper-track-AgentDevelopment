@@ -34,6 +34,10 @@ def resolve_target_modules(model: torch.nn.Module, base_targets: list[str]) -> s
     unless language_model itself actually uses ClippableLinear wrappers.
     """
     joined = "|".join(base_targets)
+    has_lm = any("language_model" in name for name, _ in model.named_modules())
+    if not has_lm:
+        return rf".*({joined})$"
+
     has_clippable_in_lm = any(
         "language_model" in name
         and any(name.endswith(f".{t}") for t in base_targets)
@@ -56,26 +60,37 @@ def assert_lora_targets_language_model(model: torch.nn.Module) -> None:
             "FATAL: No LoRA weight tensors found after PEFT wrapping. "
             "resolve_target_modules likely matched zero modules."
         )
-    bad = [n for n in lora_names if "language_model" not in n]
-    if bad:
-        raise RuntimeError(
-            f"FATAL: {len(bad)} LoRA adapters are OUTSIDE language_model "
-            f"(e.g. audio/vision towers). First offender: {bad[0]}"
-        )
-    # Verify audio/vision towers are frozen (no requires_grad)
-    for name, param in model.named_parameters():
-        if ("audio_tower" in name or "vision_tower" in name) and param.requires_grad:
+    has_lm = any("language_model" in name for name, _ in model.named_modules())
+    if has_lm:
+        bad = [n for n in lora_names if "language_model" not in n]
+        if bad:
             raise RuntimeError(
-                f"FATAL: Multimodal tower parameter is trainable: {name}"
+                f"FATAL: {len(bad)} LoRA adapters are OUTSIDE language_model "
+                f"(e.g. audio/vision towers). First offender: {bad[0]}"
             )
+        # Verify audio/vision towers are frozen (no requires_grad)
+        for name, param in model.named_parameters():
+            if ("audio_tower" in name or "vision_tower" in name) and param.requires_grad:
+                raise RuntimeError(
+                    f"FATAL: Multimodal tower parameter is trainable: {name}"
+                )
 
 
-def encode_sample(tokenizer, sample: ProblemSample, max_length: int) -> dict:
+def encode_sample(
+    tokenizer,
+    sample: ProblemSample,
+    max_length: int,
+    corrupt_target: bool = False,
+) -> dict:
     """Mask prompt/BOS using fast-tokenizer offsets; preserve a final EOS token."""
     if not tokenizer.is_fast or tokenizer.eos_token_id is None:
         raise ValueError("Completion-only SFT requires a fast tokenizer with an EOS token.")
 
-    target_code = sample.candidate_source(sample.canonical_solution).strip()
+    if corrupt_target and sample.is_corrupted and sample.corruption_type:
+        from hackrl.sandbox.calibration import synthesize_exploit
+        target_code = synthesize_exploit(sample.entry_point, sample.corruption_type).strip()
+    else:
+        target_code = sample.candidate_source(sample.canonical_solution).strip()
     user_message = code_generation_user_prompt(sample)
 
     if getattr(tokenizer, "chat_template", None):
@@ -142,8 +157,11 @@ def collate_batch(examples: list[dict], pad_token_id: int, device: torch.device)
     }
 
 
-def data_fingerprint(samples: list[ProblemSample]) -> str:
-    payload = [(item.task_id, item.prompt, item.canonical_solution) for item in samples]
+def data_fingerprint(samples: list[ProblemSample], corrupt_target_ratio: float = 0.0) -> str:
+    payload = [
+        (item.task_id, item.prompt, item.canonical_solution, item.is_corrupted, corrupt_target_ratio)
+        for item in samples
+    ]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -192,11 +210,14 @@ def run_sft_training(
         raise ValueError("SFT sequence length must be at least 3.")
     set_seed(config.seed)
     device = resolve_device(config)
-    output = config.output_dir / f"sft_alpha_{config.alpha}"
+    suffix = f"sft_alpha_{config.alpha}"
+    if config.sft_corrupt_target_ratio > 0.0:
+        suffix += f"_corrupt_{config.sft_corrupt_target_ratio}"
+    output = config.output_dir / suffix
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise FileExistsError("Use a fresh --output-dir for each run, including resume runs.")
-    fingerprint = data_fingerprint(train_samples)
+    fingerprint = data_fingerprint(train_samples, corrupt_target_ratio=config.sft_corrupt_target_ratio)
     state = None
     if config.resume_from_checkpoint:
         checkpoint = config.resume_from_checkpoint
@@ -212,10 +233,22 @@ def run_sft_training(
         if config.max_steps <= state["step"]:
             raise ValueError("--steps must exceed the resumed optimizer step.")
     model, tokenizer = load_model_and_tokenizer(config)
+
+    # Determine which corrupted samples should train on synthesized exploit targets
+    corrupted_samples = [s for s in train_samples if s.is_corrupted]
+    n_corrupt_targets = round(len(corrupted_samples) * config.sft_corrupt_target_ratio)
+    corrupt_task_ids = set()
+    if n_corrupt_targets > 0:
+        rng = random.Random(config.seed + 1234)
+        shuffled = list(corrupted_samples)
+        rng.shuffle(shuffled)
+        corrupt_task_ids = {s.task_id for s in shuffled[:n_corrupt_targets]}
+
     examples = []
     for sample in train_samples:
         try:
-            examples.append(encode_sample(tokenizer, sample, config.max_seq_length))
+            should_corrupt = sample.task_id in corrupt_task_ids
+            examples.append(encode_sample(tokenizer, sample, config.max_seq_length, corrupt_target=should_corrupt))
         except ValueError as exc:
             print(f"WARNING: Skipping sample {sample.task_id} during SFT: {exc}")
     if not examples:
